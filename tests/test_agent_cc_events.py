@@ -212,6 +212,17 @@ def test_classify_allows_overage_when_configured_to_warn(fixture):
     classify(ev, rl, "warn")     # must not raise
 
 
+def test_classify_refuses_overage_for_an_unrecognised_on_overage_value(fixture):
+    """review M-7: CodingAgentRequest.on_overage is a plain str, so a direct
+    construction can hand classify() anything — the guard whose entire job
+    is refusing to spend money must fail CLOSED on a typo, not open."""
+    from adw_modules.agent_cc import classify, OverageRefused
+    ev = _result_event(fixture)
+    rl = {"status": "allowed", "isUsingOverage": True, "utilization": 1.0}
+    with pytest.raises(OverageRefused):
+        classify(ev, rl, "abort")
+
+
 def test_classify_raises_generic_error_with_diagnostics(fixture):
     from adw_modules.agent_cc import classify, CodingAgentError
     ev = copy.deepcopy(_result_event(fixture))

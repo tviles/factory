@@ -271,7 +271,12 @@ def classify(ev: dict, last_rate_limit: Optional[dict], on_overage: str) -> None
     and kills the run reporting a prompt-engineering problem.
     """
     rl = last_rate_limit or {}
-    if rl.get("isUsingOverage") and on_overage == "fail":
+    # Fail CLOSED: `on_overage` is typed Literal["fail","warn"] upstream in
+    # ClaudeCodeDefaults, but CodingAgentRequest.on_overage is a plain str, so
+    # a direct construction bypasses that check. This guard's only job is
+    # refusing to spend money the user did not opt into, so an unrecognised
+    # value (a typo, a future default) must still refuse — not silently pass.
+    if rl.get("isUsingOverage") and on_overage != "warn":
         raise OverageRefused(
             f"the subscription is using PAID overage "
             f"(utilization={rl.get('utilization')}). Refusing to spend. Set "
