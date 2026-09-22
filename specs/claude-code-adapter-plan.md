@@ -307,22 +307,56 @@ CHATTY_CHILD = (
 )
 
 
-def test_stderr_to_file_does_not_deadlock(tmp_path):
-    """stderr=PIPE + a blocking stdout read deadlocks once the child fills the
-    ~64KB stderr pipe buffer. A file has no such buffer."""
-    err_path = tmp_path / "stderr.log"
-    started = time.monotonic()
-    lines = []
-    with err_path.open("a") as err:
-        p = subprocess.Popen([sys.executable, "-c", CHATTY_CHILD],
-                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                             stderr=err, text=True, bufsize=1)
-        for line in p.stdout:
-            lines.append(line)
-            assert time.monotonic() - started < 15, "deadlocked"
-        p.wait()
-    assert len(lines) == 2
-    assert err_path.stat().st_size == 200_000
+def test_agent_pi_run_does_not_deadlock_on_a_chatty_child(tmp_path, monkeypatch):
+    """Binds to the PRODUCTION Popen, and fails rather than hangs.
+
+    Two things this test must do that the obvious version does not:
+
+    * Drive `agent_pi.run()` itself. A test that builds its own Popen asserts
+      that the stdlib behaves as documented — restoring `stderr=PIPE` in
+      production leaves it green.
+    * Enforce its budget with a watchdog that KILLS the child. A deadlocked
+      parent blocks inside `for line in process.stdout`, so an assertion in
+      the loop body is never reached and the suite hangs forever instead of
+      failing. No pytest-timeout is configured.
+    """
+    import threading
+    from adw_modules import agent_pi
+    from adw_modules.data_types import CodingAgentRequest
+
+    # >64KB to stderr between two stdout lines — the pipe-buffer trap.
+    child = tmp_path / "chatty.py"
+    child.write_text(
+        "import sys\n"
+        "sys.stdout.write('{\"type\":\"start\"}\\n'); sys.stdout.flush()\n"
+        "sys.stderr.write('W' * 200_000); sys.stderr.flush()\n"
+        "sys.stdout.write('{\"type\":\"result\"}\\n'); sys.stdout.flush()\n")
+    monkeypatch.setattr(agent_pi, "PI_PATH", sys.executable)
+    monkeypatch.setattr(agent_pi, "resolve_model", lambda p: ("p", "m"))
+    monkeypatch.setattr(agent_pi, "context_window", lambda p, m: 0)
+    monkeypatch.setattr(agent_pi, "_build_command",
+                        lambda req: [sys.executable, str(child)], raising=False)
+
+    killed = []
+    proc_box: list = []
+
+    def watchdog():
+        if proc_box:
+            killed.append(True)
+            proc_box[0].kill()
+
+    timer = threading.Timer(20.0, watchdog)
+    timer.start()
+    try:
+        agent_pi.run(CodingAgentRequest(
+            prompt="p", system_prompt="s", model="p/m", session_id="s",
+            session_dir=str(tmp_path),
+            raw_output_path=str(tmp_path / "raw_output.jsonl"), cwd=str(tmp_path)),
+            on_spawn=lambda pid: proc_box.append(_proc_for(pid)))
+    finally:
+        timer.cancel()
+    assert not killed, "agent_pi.run deadlocked — the watchdog had to kill it"
+    assert (tmp_path / "stderr.log").stat().st_size >= 200_000
 
 
 def test_stderr_warnings_extracts_warning_lines(fixture_path):
@@ -522,8 +556,12 @@ with:
     # stderr, stops producing stdout, and both sides wait forever — the same
     # silent 0%-CPU hang the stdin comment below describes, through the other
     # pipe. A file has no fixed-size buffer, so it cannot happen.
+    # One log per agent-phase, appended to — but each send reads only ITS OWN
+    # bytes. `send()` is called repeatedly for one agent by design (see the
+    # comment at agents.py:105), so scanning the whole file would report a
+    # previous attempt's warnings, and `limit` could drop the current one.
     stderr_path = raw_path.with_name("stderr.log")
-    stderr_path.parent.mkdir(parents=True, exist_ok=True)
+    offset = stderr_path.stat().st_size if stderr_path.exists() else 0
     with stderr_path.open("a") as err:
         process = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
                                    stdout=subprocess.PIPE, stderr=err,
@@ -542,8 +580,13 @@ Replace:
 with:
 ```python
     result.returncode = process.wait()
-    stderr = "\n".join(stderr_warnings(stderr_path)) or \
-        Path(stderr_path).read_text(errors="replace")[-800:]
+    # Warnings AND the tail, never one or the other. An `or` here would let any
+    # benign `Warning:` line suppress the tail entirely, so a log holding
+    # `Warning: Unknown --effort value 'off'` plus a fatal traceback would
+    # report only the warning — strictly worse than the process.stderr.read()
+    # this replaced.
+    tail = _read_from(stderr_path, offset)[-800:]
+    stderr = "\n".join([*stderr_warnings(stderr_path, offset=offset), tail])
 ```
 
 Add `stderr_warnings` to the existing `from .utils import …` line.
