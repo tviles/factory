@@ -1985,6 +1985,38 @@ def test_run_surfaces_stderr_warnings(tmp_path, fake_claude, monkeypatch):
     assert any("Unknown --effort value" in w for w in result.warnings)
 
 
+def test_run_accepts_the_subscription_init_event(tmp_path, fake_claude, monkeypatch):
+    """The captured fixture is a real subscription run: init.apiKeySource=='none'."""
+    from adw_modules import agent_cc
+    bindir = fake_claude(tmp_path, "tool_use_roundtrip.jsonl")
+    monkeypatch.setattr(agent_cc, "CLAUDE_PATH", str(bindir / "claude"))
+    agent_cc.run(_req(tmp_path))          # must not raise
+
+
+def test_run_refuses_when_the_child_reports_api_key_billing(tmp_path, fixture_path,
+                                                            fake_claude, monkeypatch):
+    """The per-send cross-check on the feature's core claim. `preflight_auth`
+    ran at validate() time; this catches a key that appeared since."""
+    import json
+    from adw_modules import agent_cc
+    events = [json.loads(l) for l in fixture_path("tool_use_roundtrip.jsonl")
+              .read_text().splitlines() if l.strip()]
+    for e in events:
+        if e.get("subtype") == "init":
+            e["apiKeySource"] = "ANTHROPIC_API_KEY"
+    doctored = tmp_path / "billed.jsonl"
+    doctored.write_text("\n".join(json.dumps(e) for e in events) + "\n")
+    bindir = tmp_path / "fakebin"; bindir.mkdir(exist_ok=True)
+    script = bindir / "claude"
+    script.write_text("#!/usr/bin/env python3\nimport sys,pathlib\n"
+                      f"sys.stdout.write(pathlib.Path({str(doctored)!r}).read_text())\n")
+    script.chmod(0o755)
+    monkeypatch.setattr(agent_cc, "CLAUDE_PATH", str(script))
+    with pytest.raises(agent_cc.NotAuthenticated) as e:
+        agent_cc.run(_req(tmp_path))
+    assert "ANTHROPIC_API_KEY" in str(e.value)
+
+
 def test_run_scans_only_this_attempts_stderr_on_retry(tmp_path, fake_claude, monkeypatch):
     """send() is called repeatedly against ONE append-mode log, so attempt 2
     must not report attempt 1's warnings. Same defect Task 2 fixed in
@@ -2099,6 +2131,34 @@ def build_command(request: CodingAgentRequest) -> tuple[list[str], list[str]]:
     return cmd, warnings
 
 
+def _assert_subscription_auth(init_event: dict, inherit_api_key: bool) -> None:
+    """Cross-check, per send, that the CHILD is billing what the preflight predicted.
+
+    `preflight_auth` runs once in validate(); this fires on every run, and it
+    is the only per-run verification of the feature's core claim. Between the
+    two, a stale shell, a hook, or a bug in `claude_code_env` could still put a
+    key in front of the child.
+
+    NOTE the value semantics differ between the two surfaces, and the
+    difference is load-bearing — do not "unify" these two checks:
+
+      * `claude auth status` OMITS `apiKeySource` entirely when no key is in
+        use, so `parse_auth_status` truthy-checks it.
+      * the stream's `init` event reports the STRING `"none"` for subscription
+        auth, so this one compares against that string. A truthy check here
+        would reject every legitimate subscription run.
+    """
+    if inherit_api_key:
+        return
+    source = init_event.get("apiKeySource")
+    if source not in (None, "none"):
+        raise NotAuthenticated(
+            f"Claude Code is billing {source!r}, not your subscription, despite "
+            f"the startup preflight passing. Something put a key in front of "
+            f"the child after validate() ran. Set "
+            f"defaults.claude_code.inherit_api_key: true to allow it.")
+
+
 def run(request: CodingAgentRequest,
         on_event: Optional[Callable[[dict], None]] = None,
         on_spawn: Optional[Callable[[int], None]] = None,
@@ -2172,7 +2232,9 @@ def run(request: CodingAgentRequest,
                     event = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if event.get("type") == "rate_limit_event":
+                if event.get("subtype") == "init":
+                    _assert_subscription_auth(event, request.inherit_api_key)
+                elif event.get("type") == "rate_limit_event":
                     last_rate_limit = event.get("rate_limit_info") or {}
                 elif event.get("type") == "result":
                     result_event = event
