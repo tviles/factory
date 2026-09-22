@@ -209,11 +209,47 @@ class Tracer:
                           (request[:500], adw_id))
 
     def session_finish(self, adw_id: str, ok: bool) -> None:
+        if self.conn is None:
+            # A run finishes exactly once in practice, but this guards the
+            # one realistic double-call: session._finalize_when_killed's
+            # SIGTERM/SIGINT handler can preempt the main thread at any
+            # instruction boundary, including right after Run.finish's own
+            # session_finish already closed the connection. Without this, that
+            # race is a crash (`AttributeError: 'NoneType' has no attribute
+            # 'execute'`) in a signal handler — exactly the kind of dead-
+            # connection write this method must never produce.
+            return
         self.conn.execute(
             "UPDATE sessions SET status=?, ended_at=? WHERE adw_id=?",
             ("success" if ok else "fail", now_iso(), adw_id),
         )
         self.processes_end_all(adw_id)   # nothing of this run is alive any more
+        # session_finish is the last write on every path that ends a run: the
+        # normal one (Run.finish), the phase-raised one (Run.phase's except
+        # branch, runner.py), and session._finalize_when_killed's SIGTERM/
+        # SIGINT handler, which calls this and then raises SystemExit. None of
+        # those three call sites touch self.conn again afterward — verified by
+        # reading every caller, not assumed — so closing HERE, at the one
+        # chokepoint all three already funnel through, cannot leave a later
+        # write hitting a dead connection. The visualizer polls sssf.db from
+        # its OWN connection in WAL mode (see last_rate_limit's read-only
+        # connect above); closing the writer's handle here does not touch it.
+        self.close()
+
+    def close(self) -> None:
+        """Release the sqlite connection this Tracer owns.
+
+        `-W error::ResourceWarning` reported one unclosed-database warning per
+        Tracer built in the test suite before this existed — one connection
+        per Tracer (unlike the per-SEND pipe leak agent_pi.py/agent_cc.py fix,
+        this is per-run, so it is far less severe, but it is still a resource
+        this object owns and never released). Idempotent: a second call (the
+        signal handler racing an already-finished run, or a defensive future
+        caller) must not raise.
+        """
+        if self.conn is not None:
+            self.conn.close()
+            self.conn = None
 
     def session_add_usage(self, adw_id: str, tokens: int, cost: float) -> None:
         self.conn.execute(

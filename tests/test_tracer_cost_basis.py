@@ -1,10 +1,23 @@
 import inspect
 import sqlite3
 
+import pytest
 
-def _tracer(tmp_path):
+
+@pytest.fixture
+def tracer(tmp_path):
+    """A live Tracer, closed on teardown.
+
+    `-W error::ResourceWarning` reported one "unclosed database" warning per
+    test in this file that built a Tracer by hand and never closed it —
+    Tracer.__init__ opens a real sqlite3.connect() (see tracer.py's close()).
+    None of these tests exercise a full run (session_finish, which now closes
+    on its own), so the fixture is what releases it here.
+    """
     from adw_modules.tracer import Tracer
-    return Tracer(tmp_path / "sssf.db", tmp_path / "events.jsonl")
+    t = Tracer(tmp_path / "sssf.db", tmp_path / "events.jsonl")
+    yield t
+    t.close()
 
 
 def _agent(name="scout", coding_agent="claude_code"):
@@ -14,31 +27,28 @@ def _agent(name="scout", coding_agent="claude_code"):
                        prompt_engineering={"system": "s", "user": "u"})
 
 
-def test_cost_basis_column_exists(tmp_path):
-    t = _tracer(tmp_path)
-    cols = {row[1] for row in t.conn.execute("PRAGMA table_info(agent_sessions)")}
+def test_cost_basis_column_exists(tracer):
+    cols = {row[1] for row in tracer.conn.execute("PRAGMA table_info(agent_sessions)")}
     assert "cost_basis" in cols
 
 
-def test_cost_basis_is_persisted(tmp_path):
+def test_cost_basis_is_persisted(tracer):
     from adw_modules.data_types import AgentSessionRecord
-    t = _tracer(tmp_path)
-    t.session_start("adw1", "eng")
-    t.agent_session_row(AgentSessionRecord(
+    tracer.session_start("adw1", "eng")
+    tracer.agent_session_row(AgentSessionRecord(
         adw_id="adw1", agent=_agent(), session_id="sess-1", context_tokens=10,
         context_window=200_000, cost_basis="list"))
-    row = t.conn.execute(
+    row = tracer.conn.execute(
         "SELECT cost_basis FROM agent_sessions WHERE adw_id='adw1'").fetchone()
     assert row[0] == "list"
 
 
-def test_cost_basis_defaults_to_billed_for_pi(tmp_path):
+def test_cost_basis_defaults_to_billed_for_pi(tracer):
     from adw_modules.data_types import AgentSessionRecord
-    t = _tracer(tmp_path)
-    t.session_start("adw1", "eng")
-    t.agent_session_row(AgentSessionRecord(
+    tracer.session_start("adw1", "eng")
+    tracer.agent_session_row(AgentSessionRecord(
         adw_id="adw1", agent=_agent(coding_agent="pi"), session_id="sess-1"))
-    row = t.conn.execute(
+    row = tracer.conn.execute(
         "SELECT cost_basis FROM agent_sessions WHERE adw_id='adw1'").fetchone()
     assert row[0] == "billed"
 
@@ -62,16 +72,15 @@ def test_process_start_takes_one_object(tmp_path):
     assert params == ["self", "record"]
 
 
-def test_process_start_persists_command_for_pid_reuse_safety(tmp_path):
+def test_process_start_persists_command_for_pid_reuse_safety(tracer):
     """process_start's whole point is recording `command` so a recycled pid is
     not killed by mistake (see the docstring) — the move to ProcessRecord must
     not silently drop or default that field for an existing caller."""
     from adw_modules.data_types import ProcessRecord
-    t = _tracer(tmp_path)
-    t.session_start("adw1", "eng")
-    t.process_start(ProcessRecord(adw_id="adw1", kind="agent", name="scout",
-                                  pid=4242, command="claude_code scout gemini"))
-    row = t.conn.execute(
+    tracer.session_start("adw1", "eng")
+    tracer.process_start(ProcessRecord(adw_id="adw1", kind="agent", name="scout",
+                                       pid=4242, command="claude_code scout gemini"))
+    row = tracer.conn.execute(
         "SELECT kind, name, pid, command FROM processes WHERE adw_id='adw1'"
     ).fetchone()
     assert row == ("agent", "scout", 4242, "claude_code scout gemini")
@@ -96,36 +105,34 @@ def test_envelope_row_takes_one_object(tmp_path):
     assert params == ["self", "record"]
 
 
-def test_envelope_row_persists_all_fields(tmp_path):
+def test_envelope_row_persists_all_fields(tracer):
     """The move to EnvelopeRecord must not silently drop or default a field
     an existing caller relies on."""
     from adw_modules.data_types import EnvelopeRecord
-    t = _tracer(tmp_path)
-    t.session_start("adw1", "eng")
-    t.envelope_row(EnvelopeRecord(
+    tracer.session_start("adw1", "eng")
+    tracer.envelope_row(EnvelopeRecord(
         phase=_phase("adw1"), agent="scout", output_type="GenericOutput",
         payload_json='{"status": "success"}', valid=True, attempt=1))
-    row = t.conn.execute(
+    row = tracer.conn.execute(
         "SELECT adw_id, phase_id, agent, output_type, payload_json, valid,"
         " attempt FROM envelopes WHERE adw_id='adw1'").fetchone()
     assert row == ("adw1", "adw1_01_build", "scout", "GenericOutput",
                    '{"status": "success"}', 1, 1)
 
 
-def test_agent_session_row_persists_every_column(tmp_path):
+def test_agent_session_row_persists_every_column(tracer):
     """The move to AgentSessionRecord must not silently drop or default a
     field an existing caller relies on — supplements the signature-only
     check above with a real read-back of every non-timestamp column."""
     from adw_modules.data_types import AgentSessionRecord
-    t = _tracer(tmp_path)
-    t.session_start("adw1", "eng")
+    tracer.session_start("adw1", "eng")
     agent = _agent(name="scout", coding_agent="claude_code")
     agent.color = "#ff0000"
-    t.agent_session_row(AgentSessionRecord(
+    tracer.agent_session_row(AgentSessionRecord(
         adw_id="adw1", agent=agent, session_id="sess-1", context_tokens=123,
         context_window=200_000, cost_basis="list"))
 
-    row = t.conn.execute(
+    row = tracer.conn.execute(
         "SELECT adw_id, agent, coding_agent, model, color, session_id,"
         " context_tokens, context_window, cost_basis"
         " FROM agent_sessions WHERE adw_id='adw1' AND agent='scout'").fetchone()
@@ -134,7 +141,7 @@ def test_agent_session_row_persists_every_column(tmp_path):
                    "#ff0000", "sess-1", 123, 200_000, "list")
 
 
-def test_agent_session_row_upserts_on_conflict_instead_of_duplicating(tmp_path):
+def test_agent_session_row_upserts_on_conflict_instead_of_duplicating(tracer):
     """agent_session_row's INSERT carries an ON CONFLICT(adw_id, agent) DO
     UPDATE — a second call for the same (adw_id, agent) must update the
     existing row's mutable columns in place, not raise or duplicate it.
@@ -143,25 +150,24 @@ def test_agent_session_row_upserts_on_conflict_instead_of_duplicating(tmp_path):
     import time
 
     from adw_modules.data_types import AgentSessionRecord
-    t = _tracer(tmp_path)
-    t.session_start("adw1", "eng")
+    tracer.session_start("adw1", "eng")
     agent = _agent(name="scout", coding_agent="claude_code")
 
-    t.agent_session_row(AgentSessionRecord(
+    tracer.agent_session_row(AgentSessionRecord(
         adw_id="adw1", agent=agent, session_id="sess-1", context_tokens=10,
         context_window=100_000, cost_basis="billed"))
-    first_created_at = t.conn.execute(
+    first_created_at = tracer.conn.execute(
         "SELECT created_at FROM agent_sessions WHERE adw_id='adw1' AND agent='scout'"
     ).fetchone()[0]
 
     time.sleep(0.01)   # created_at/last_used_at are second-resolution ISO stamps
     agent.model = "anthropic/claude-opus-5"
     agent.color = "#00ff00"
-    t.agent_session_row(AgentSessionRecord(
+    tracer.agent_session_row(AgentSessionRecord(
         adw_id="adw1", agent=agent, session_id="sess-2", context_tokens=999,
         context_window=500_000, cost_basis="list"))
 
-    rows = t.conn.execute(
+    rows = tracer.conn.execute(
         "SELECT model, color, session_id, context_tokens, context_window,"
         " cost_basis, created_at, last_used_at"
         " FROM agent_sessions WHERE adw_id='adw1' AND agent='scout'").fetchall()
@@ -189,3 +195,4 @@ def test_migration_adds_the_column_to_an_older_db(tmp_path):
     t = Tracer(db, tmp_path / "events.jsonl")
     cols = {row[1] for row in t.conn.execute("PRAGMA table_info(agent_sessions)")}
     assert "cost_basis" in cols
+    t.close()
