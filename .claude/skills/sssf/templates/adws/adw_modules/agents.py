@@ -19,10 +19,10 @@ import yaml
 
 from . import agent_cc, agent_pi, permissions, prompts
 from . import tracer as tracer_mod
-from .data_types import (AgentCall, AgentConfig, CodingAgentRequest,
-                         CodingAgentResult, EnvelopeBase, EventRecord,
-                         GateCheck, GateReport, Phase, SSSFConfig,
-                         UsageBreakdown)
+from .data_types import (AgentCall, AgentConfig, AgentSessionRecord,
+                         CodingAgentRequest, CodingAgentResult, EnvelopeBase,
+                         EventRecord, GateCheck, GateReport, Phase,
+                         ProcessRecord, SSSFConfig, UsageBreakdown)
 from .utils import new_id
 
 JSON_FIX_ATTEMPTS = 2      # continue-with-correction attempts for malformed JSON
@@ -261,9 +261,9 @@ def execute(run, phase: Phase, call: AgentCall) -> EnvelopeBase:
             # ADW no longer reaches pi directly. Tracking the pid here is
             # what makes session.py's signal handler still able to reap it.
             run.live_children.add(pid)
-            run.tracer.process_start(
-                run.adw_id, "agent", agent.name, pid,
-                f"{agent.coding_agent} {agent.name} {agent.model}")
+            run.tracer.process_start(ProcessRecord(
+                adw_id=run.adw_id, kind="agent", name=agent.name, pid=pid,
+                command=f"{agent.coding_agent} {agent.name} {agent.model}"))
 
         def _on_exit(pid: int) -> None:
             run.live_children.discard(pid)
@@ -373,10 +373,11 @@ def execute(run, phase: Phase, call: AgentCall) -> EnvelopeBase:
     _persist_envelope(run, phase, agent.name, call, envelope, attempt, valid=True)
     run.console.envelope_summary(envelope)
     context = latest or result
-    run.tracer.agent_session_row(run.adw_id, agent, session_id,
-                                 context_tokens=context.context_tokens,
-                                 context_window=context.context_window,
-                                 cost_basis=getattr(context, "cost_basis", "billed"))
+    run.tracer.agent_session_row(AgentSessionRecord(
+        adw_id=run.adw_id, agent=agent, session_id=session_id,
+        context_tokens=context.context_tokens,
+        context_window=context.context_window,
+        cost_basis=getattr(context, "cost_basis", "billed")))
     run.save_agent_map(agent.name, {"session_id": session_id, "model": agent.model,
                                     "coding_agent": agent.coding_agent,
                                     "cc_session_uuid": cc_uuid,

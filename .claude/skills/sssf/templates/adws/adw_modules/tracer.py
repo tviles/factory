@@ -12,7 +12,8 @@ import sqlite3
 from pathlib import Path
 from typing import Optional
 
-from .data_types import AgentConfig, EventRecord, GateReport, Phase
+from .data_types import (AgentSessionRecord, EventRecord, GateReport, Phase,
+                         ProcessRecord)
 from .utils import ensure_dir, new_id, now_iso
 
 SCHEMA = """
@@ -221,8 +222,7 @@ class Tracer:
         )
 
     # ── processes (adw_id → pid, so a hung run can be found and killed) ─────
-    def process_start(self, adw_id: str, kind: str, name: str, pid: int,
-                      command: str) -> None:
+    def process_start(self, record: ProcessRecord) -> None:
         """Record a live process for this run.
 
         A coding agent that hangs produces no events at all, which is exactly
@@ -233,7 +233,8 @@ class Tracer:
         self.conn.execute(
             "INSERT INTO processes (adw_id, kind, name, pid, command, started_at)"
             " VALUES (?,?,?,?,?,?)",
-            (adw_id, kind, name, pid, command[:500], now_iso()),
+            (record.adw_id, record.kind, record.name, record.pid,
+             record.command[:500], now_iso()),
         )
 
     def process_end(self, adw_id: str, pid: int) -> None:
@@ -298,9 +299,7 @@ class Tracer:
              json.dumps([c.model_dump() for c in report.checks]), now_iso()),
         )
 
-    def agent_session_row(self, adw_id: str, agent: AgentConfig, session_id: str,
-                          context_tokens: int = 0, context_window: int = 0,
-                          cost_basis: str = "billed") -> None:
+    def agent_session_row(self, record: AgentSessionRecord) -> None:
         """The agent's config row is the source of truth for its label and color.
 
         Context is carried here rather than derived from events because the lane
@@ -308,6 +307,7 @@ class Tracer:
         same agent twice overwrites it, exactly like model and session_id.
         """
         ts = now_iso()
+        agent = record.agent
         self.conn.execute(
             "INSERT INTO agent_sessions (adw_id, agent, coding_agent, model, color,"
             " session_id, context_tokens, context_window, cost_basis, created_at,"
@@ -319,6 +319,7 @@ class Tracer:
             " context_window=excluded.context_window,"
             " cost_basis=excluded.cost_basis,"
             " last_used_at=excluded.last_used_at",
-            (adw_id, agent.name, agent.coding_agent, agent.model, agent.color,
-             session_id, context_tokens, context_window, cost_basis, ts, ts),
+            (record.adw_id, agent.name, agent.coding_agent, agent.model, agent.color,
+             record.session_id, record.context_tokens, record.context_window,
+             record.cost_basis, ts, ts),
         )

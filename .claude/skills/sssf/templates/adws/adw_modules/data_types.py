@@ -369,6 +369,23 @@ class SSSFConfig(BaseModel):
 
 # ── Tracing ──────────────────────────────────────────────────────────────────
 
+class ProcessRecord(BaseModel):
+    """Everything tracer.process_start() needs. One object, never loose params.
+
+    A coding agent that hangs produces no events at all, which is exactly when
+    you need its pid — and `ps` cannot tell you which adw_id it belongs to.
+    `command` is what makes a recycled pid safe to leave alone rather than
+    kill by mistake (see Tracer.process_start's docstring); that behaviour
+    must survive this type unchanged.
+    """
+
+    adw_id: str
+    kind: str                       # 'adw' (the workflow process) | 'agent' (a coding-agent child)
+    name: str                       # '' for the adw, the agent name for a child
+    pid: int
+    command: str
+
+
 class EventRecord(BaseModel):
     """One traced event, always logged against adw_id + phase."""
 
@@ -384,6 +401,24 @@ class EventRecord(BaseModel):
     # the tracer stamps started_at with the moment the event was recorded.
     started_at: Optional[str] = None
     ended_at: Optional[str] = None
+
+
+class AgentSessionRecord(BaseModel):
+    """Everything tracer.agent_session_row() needs. One object, never loose params.
+
+    The row is an upsert keyed on (adw_id, agent): identity (agent, session_id)
+    and the latest context/cost readings all land in the same write, and the
+    caller (agents.py's execute()) already has every field on hand at that one
+    moment — this was five params before cost_basis made it six, the second
+    time this signature grew past the four-param rule rather than the first.
+    """
+
+    adw_id: str
+    agent: AgentConfig
+    session_id: str
+    context_tokens: int = 0         # window occupancy after the agent's last turn
+    context_window: int = 0         # the model's ceiling; 0/NULL = unknown
+    cost_basis: str = "billed"      # 'billed' (real money) | 'list' (subscription notional)
 
 
 # ── Pi coding agent interface ────────────────────────────────────────────────
