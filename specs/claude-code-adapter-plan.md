@@ -2591,7 +2591,7 @@ In `agents.execute()`, replace the session id line and the `send` closure:
     # Pi ignores the flag; its one flag already does both.
     resumed = reused
 
-    def send(prompt_text: str) -> agent_pi.PiResult:
+    def send(prompt_text: str) -> CodingAgentResult:
         nonlocal latest, resumed
         request = CodingAgentRequest(
             prompt=prompt_text,
@@ -2612,19 +2612,17 @@ In `agents.execute()`, replace the session id line and the `send` closure:
             on_overage=run.cfg.defaults.claude_code.on_overage,
             timeout_seconds=run.cfg.defaults.claude_code.timeout_seconds,
         )
+        # KEEP the `_on_spawn` / `_on_exit` named functions exactly as they
+        # already exist in agents.py — including their comment. They landed in
+        # Task 2's fix round and were reviewed there; do not rewrite them as
+        # lambdas. Only the two call arguments below change, because the
+        # adapter is now resolved from the dispatch table rather than being
+        # agent_pi unconditionally.
         result = adapter.run(
             request,
             on_event=_event_forwarder(run, phase, agent.name, adapter),
-            # live_children is what the signal handler reaps (Task 2). It is
-            # tracked in memory rather than read back from the processes table
-            # because that table also holds rows from crashed runs, and a
-            # recycled pid handed to os.killpg can signal an unrelated GROUP.
-            on_spawn=lambda pid: (run.live_children.add(pid),
-                                  run.tracer.process_start(
-                                      run.adw_id, "agent", agent.name, pid,
-                                      f"{agent.coding_agent} {agent.name} {agent.model}")),
-            on_exit=lambda pid: (run.live_children.discard(pid),
-                                 run.tracer.process_end(run.adw_id, pid)))
+            on_spawn=_on_spawn,
+            on_exit=_on_exit)
         resumed = True                      # every later send continues
         for warning in getattr(result, "warnings", []):
             run.tracer.event(EventRecord(adw_id=run.adw_id, phase_id=phase.phase_id,
