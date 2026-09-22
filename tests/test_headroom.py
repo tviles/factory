@@ -96,6 +96,40 @@ def test_validate_refuses_when_a_live_window_is_exhausted(tmp_path, monkeypatch)
     assert "seven_day" in str(e.value) and "0.88" in str(e.value)
 
 
+def test_last_rate_limit_skips_a_row_whose_payload_is_a_json_list(tmp_path):
+    """Valid JSON that is not an object is as unusable as no payload at all."""
+    from adw_modules.tracer import last_rate_limit
+    db = _db(tmp_path, [1, 2, 3], {"rate_limit": CAPTURED})
+    assert last_rate_limit(db) == CAPTURED
+
+
+def test_last_rate_limit_skips_a_row_whose_payload_is_a_json_scalar(tmp_path):
+    from adw_modules.tracer import last_rate_limit
+    db = _db(tmp_path, "3", {"rate_limit": CAPTURED})
+    assert last_rate_limit(db) == CAPTURED
+
+
+def test_last_rate_limit_returns_none_when_only_bad_shapes_exist(tmp_path):
+    from adw_modules.tracer import last_rate_limit
+    assert last_rate_limit(_db(tmp_path, [1, 2, 3], "3")) is None
+
+
+def test_exhausted_windows_returns_empty_for_a_non_dict_reading():
+    from adw_modules.agents import exhausted_windows
+    assert exhausted_windows([1, 2, 3], 0.80, now=BEFORE_RESET) == []
+    assert exhausted_windows("not a dict", 0.80, now=BEFORE_RESET) == []
+    assert exhausted_windows(None, 0.80, now=BEFORE_RESET) == []
+
+
+def test_exhausted_windows_skips_a_non_dict_window_entry():
+    """A window value that isn't a dict must be treated as unknown, not raise."""
+    from adw_modules.agents import exhausted_windows
+    bad = {"unifiedWindows": {"seven_day": "not-a-dict",
+                              "five_hour": {"utilization": 0.99,
+                                            "resetsAt": 1790100000}}}
+    assert [h[0] for h in exhausted_windows(bad, 0.80, now=BEFORE_RESET)] == ["five_hour"]
+
+
 def test_validate_does_not_check_headroom_for_a_pi_only_chain(tmp_path, monkeypatch):
     """A claude_code agent elsewhere in the roster must not block a pi chain."""
     from adw_modules import agent_pi, agents

@@ -51,13 +51,23 @@ def exhausted_windows(rate_limit: dict, max_utilization: float,
     void. That is why this cannot raise a false alarm.
     """
     now = _now() if now is None else now
-    windows = rate_limit.get("unifiedWindows") or {}
+    # A reading that is not a dict at all (or a window entry that is not one)
+    # is exactly as unusable as a missing one — degrade to "unknown" rather
+    # than let `.get` on the wrong shape raise inside a pre-check that must
+    # never be the reason a chain crashes.
+    if not isinstance(rate_limit, dict):
+        return []
+    windows = rate_limit.get("unifiedWindows")
+    if not isinstance(windows, dict):
+        windows = {}
     if not windows and rate_limit.get("resetsAt"):
         windows = {rate_limit.get("rateLimitType", "window"): {
             "utilization": rate_limit.get("utilization", 0.0),
             "resetsAt": rate_limit["resetsAt"]}}
     hits = []
     for name, window in windows.items():
+        if not isinstance(window, dict):
+            continue
         resets_at = window.get("resetsAt") or 0
         if now >= resets_at:
             continue                                # window reset; reading void

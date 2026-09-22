@@ -122,10 +122,17 @@ def last_rate_limit(db_path: str | Path) -> Optional[dict]:
                 "SELECT payload_json FROM events WHERE type='agent_end' "
                 "ORDER BY rowid DESC LIMIT 25"):
             try:
-                rate_limit = (json.loads(payload or "{}") or {}).get("rate_limit")
+                parsed = json.loads(payload or "{}")
             except json.JSONDecodeError:
                 continue
-            if rate_limit:
+            # A payload can be valid JSON and still not be an object — e.g. a
+            # bare list or scalar — and `.get` on that raises AttributeError.
+            # That must degrade to "keep looking", not blow up a check whose
+            # whole job is to be inert.
+            if not isinstance(parsed, dict):
+                continue
+            rate_limit = parsed.get("rate_limit")
+            if isinstance(rate_limit, dict) and rate_limit:
                 return rate_limit
         return None
     except sqlite3.Error:
