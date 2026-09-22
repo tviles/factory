@@ -15,13 +15,19 @@ from typing import Optional
 
 import yaml
 
-from . import agent_pi, permissions, prompts
-from .data_types import (AgentCall, AgentConfig, EnvelopeBase, EventRecord,
-                         GateCheck, GateReport, Phase, PiRequest, SSSFConfig,
+from . import agent_cc, agent_pi, permissions, prompts
+from .data_types import (AgentCall, AgentConfig, CodingAgentRequest,
+                         CodingAgentResult, EnvelopeBase, EventRecord,
+                         GateCheck, GateReport, Phase, SSSFConfig,
                          UsageBreakdown)
 from .utils import new_id
 
 JSON_FIX_ATTEMPTS = 2      # continue-with-correction attempts for malformed JSON
+
+# The dispatch point v1 never had: agents.py imported agent_pi directly and
+# called it unconditionally, so `coding_agent` was recorded in the trace and
+# then ignored at the call site.
+ADAPTERS = {"pi": agent_pi, "claude_code": agent_cc}
 
 
 class GateFailure(RuntimeError):
@@ -50,25 +56,63 @@ def resolve(cfg: SSSFConfig, name: str) -> AgentConfig:
 
 
 def validate(cfg: SSSFConfig, required: list[str]) -> None:
-    """Fail fast: every required name must resolve to a usable agent."""
-    problems = []
+    """Fail fast: every required name must resolve to a usable agent.
+
+    Dispatches per agent. The v1 version called `agent_pi.resolve_model` for
+    EVERY agent, which shells out to `pi --list-models` — a claude_code agent
+    would have failed for the wrong reason on a machine without pi, and no
+    Anthropic model is in pi's catalog anyway.
+    """
+    problems: list[str] = []
+    needs_cc_preflight = False
     for name in required:
         try:
             agent = resolve(cfg, name)
         except SystemExit as e:
             problems.append(str(e))
             continue
-        if agent.coding_agent != "pi":
-            problems.append(f"agent {name!r}: coding_agent {agent.coding_agent!r} "
-                            f"is not implemented in v1 (pi only)")
+        adapter = ADAPTERS.get(agent.coding_agent)
+        if adapter is None:
+            problems.append(f"agent {name!r}: unknown coding_agent "
+                            f"{agent.coding_agent!r} (known: {sorted(ADAPTERS)})")
+            continue
         for label, ref in (("system", agent.prompt_engineering.system),
                            ("user", agent.prompt_engineering.user)):
             if not Path(ref).is_file():
                 problems.append(f"agent {name!r}: {label} prompt not found: {ref}")
         try:
-            agent_pi.resolve_model(agent.model)
+            adapter.resolve_model(agent.model)
         except ValueError as e:
             problems.append(f"agent {name!r}: {e}")
+        if agent.coding_agent != "claude_code":
+            continue
+
+        needs_cc_preflight = True
+        # Everything below is checkable without spawning anything, so it
+        # belongs here rather than surfacing mid-chain (hard rule 1).
+        try:
+            agent_cc.map_effort(agent.thinking)
+        except ValueError as e:
+            problems.append(f"agent {name!r}: {e}")
+        try:
+            agent_cc.map_tools(agent.tools)
+        except ValueError as e:
+            problems.append(f"agent {name!r}: {e}")
+        if agent.harness_engineering:
+            problems.append(
+                f"agent {name!r}: harness_engineering entries "
+                f"{agent.harness_engineering} are Pi extensions and cannot load "
+                f"under coding_agent: claude_code. Claude Code has a built-in "
+                f"Task tool — drop the entries and the four subagent_* tools, "
+                f"and add 'Task' to this agent's tools.")
+
+    # One CLI call for the whole roster, not one per agent.
+    if needs_cc_preflight and not problems:
+        try:
+            agent_cc.preflight_auth(cfg.defaults.claude_code.inherit_api_key)
+        except ValueError as e:
+            problems.append(str(e))
+
     if problems:
         raise SystemExit("config validation failed:\n- " + "\n- ".join(problems))
 
@@ -91,7 +135,8 @@ def execute(run, phase: Phase, call: AgentCall) -> EnvelopeBase:
     prompts.save(agent_dir / "prompts", "system.md", system_text)
     prompts.save(agent_dir / "prompts", "user.md", user_text)
 
-    session_id = _agent_session_id(run, agent)
+    session_id, reused = _agent_session_id(run, agent)
+    adapter = ADAPTERS[agent.coding_agent]
     run.tracer.event(EventRecord(adw_id=run.adw_id, phase_id=phase.phase_id,
                                  type="agent_start", name=agent.name,
                                  payload={"model": agent.model, "thinking": agent.thinking,
@@ -103,26 +148,41 @@ def execute(run, phase: Phase, call: AgentCall) -> EnvelopeBase:
                                           "harness_engineering": agent.harness_engineering}))
     run.console.agent_started(agent.name, agent.model, session_id)
 
-    # Parse retries and gate corrections re-enter the SAME pi session, so the
+    # Parse retries and gate corrections re-enter the SAME session, so the
     # last send is the one whose context occupancy is current — while spend is
     # the opposite: every send costs, so usage accumulates across all of them.
-    latest: agent_pi.PiResult | None = None
+    latest: CodingAgentResult | None = None
     spent = UsageBreakdown()
 
-    def send(prompt_text: str) -> agent_pi.PiResult:
-        nonlocal latest
-        request = PiRequest(
+    # Claude Code's --session-id CREATES and errors if the id exists, so the
+    # adapter must be told which send this is. Only execute() knows: send #1
+    # continues iff we rejoined a prior session, and every send after it —
+    # JSON corrections, gate corrections — is by definition a continuation.
+    # Pi ignores the flag; its one flag already does both.
+    resumed = reused
+
+    def send(prompt_text: str) -> CodingAgentResult:
+        nonlocal latest, resumed
+        request = CodingAgentRequest(
             prompt=prompt_text,
             system_prompt=system_text,
+            system_prompt_path=str((agent_dir / "prompts" / "system.md").resolve()),
             model=agent.model,
             thinking=agent.thinking,
             session_id=session_id,
-            # absolute: these are read by the pi subprocess, which runs in repo_root
+            resume=resumed,
+            # absolute: these are read by the coding-agent subprocess, which
+            # runs in repo_root
             session_dir=str((agent_dir / "pi_sessions").resolve()),
             raw_output_path=str((agent_dir / "raw_output.jsonl").resolve()),
+            stderr_path=str((agent_dir / "stderr.log").resolve()),
             tools=agent.tools,
             extensions=agent.harness_engineering,
             cwd=str(run.repo_root),
+            restricted=agent.writes == [],
+            inherit_api_key=run.cfg.defaults.claude_code.inherit_api_key,
+            on_overage=run.cfg.defaults.claude_code.on_overage,
+            timeout_seconds=run.cfg.defaults.claude_code.timeout_seconds,
         )
         def _on_spawn(pid: int) -> None:
             # agent_pi.py spawns pi with start_new_session=True, which takes
@@ -138,11 +198,17 @@ def execute(run, phase: Phase, call: AgentCall) -> EnvelopeBase:
             run.live_children.discard(pid)
             run.tracer.process_end(run.adw_id, pid)
 
-        result = agent_pi.run(
+        result = adapter.run(
             request,
-            on_event=_event_forwarder(run, phase, agent.name),
+            on_event=_event_forwarder(run, phase, agent.name, adapter),
             on_spawn=_on_spawn,
             on_exit=_on_exit)
+        resumed = True                      # every later send continues
+        for warning in getattr(result, "warnings", []):
+            run.tracer.event(EventRecord(adw_id=run.adw_id, phase_id=phase.phase_id,
+                                         type="log", name="coding_agent_warning",
+                                         payload={"agent": agent.name,
+                                                  "message": warning}))
         run.add_usage(result.tokens, result.cost)
         spent.merge(result.usage)
         latest = result
@@ -237,16 +303,23 @@ def _as_report(result) -> GateReport:
     return GateReport(checks=[GateCheck(item=str(v), ok=False) for v in (result or [])])
 
 
-def _agent_session_id(run, agent: AgentConfig) -> str:
+def _agent_session_id(run, agent: AgentConfig) -> tuple[str, bool]:
+    """Returns (session_id, reused).
+
+    `reused` is the one place "did we rejoin a prior session?" gets decided —
+    execute() reads it once to seed `resumed` rather than re-deriving this
+    same agent_map lookup a second time, which would risk the two conditions
+    drifting apart under a later edit.
+    """
     entry = run.agent_map.get(agent.name)
     if entry and entry.get("model") == agent.model:
-        return entry["session_id"]           # rejoin the existing context window
-    return f"sssf-{run.adw_id}-{agent.name}-{new_id(4)}"
+        return entry["session_id"], True     # rejoin the existing context window
+    return f"sssf-{run.adw_id}-{agent.name}-{new_id(4)}", False
 
 
-def _event_forwarder(run, phase: Phase, agent_name: str):
+def _event_forwarder(run, phase: Phase, agent_name: str, adapter):
     """One tool_call event per real tool call, with its exact args and result."""
-    tracker = agent_pi.ToolCallTracker()
+    tracker = adapter.ToolCallTracker()
 
     def forward(event: dict) -> None:
         # observe() returns a LIST: one event can close several parallel tool
