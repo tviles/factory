@@ -110,6 +110,13 @@ def last_rate_limit(db_path: str | Path) -> Optional[dict]:
     and run migrations as a side effect of a check that is supposed to be
     inert. Returns None when there is no db yet, or no claude_code history:
     the first run of a fresh repo simply has nothing to go on.
+
+    Scans two event shapes: a successful send's `agent_end` (the ordinary
+    case), and a failed send's `rate_limit_observed` log (agents.py's send() —
+    RateLimited/OverageRefused propagate straight out of execute(), before
+    agent_end ever fires, so a rejected/blocked window — the reading most
+    likely to trip the headroom guard below — would otherwise never reach the
+    trace at all; review Important #5).
     """
     if not Path(db_path).exists():
         return None
@@ -120,6 +127,7 @@ def last_rate_limit(db_path: str | Path) -> Optional[dict]:
     try:
         for (payload,) in conn.execute(
                 "SELECT payload_json FROM events WHERE type='agent_end' "
+                "   OR (type='log' AND name='rate_limit_observed') "
                 "ORDER BY rowid DESC LIMIT 25"):
             try:
                 parsed = json.loads(payload or "{}")

@@ -14,12 +14,21 @@ AFTER_RESET = 1790200000
 
 
 def _db(tmp_path, *payloads):
+    return _db_rows(tmp_path, *[("agent_end", "", payload) for payload in payloads])
+
+
+def _db_rows(tmp_path, *rows):
+    """Like `_db`, but each row is (type, name, payload) — for exercising the
+    rate_limit_observed log event `last_rate_limit()` also scans (review
+    Important #5: a RateLimited/OverageRefused raise propagates out of
+    execute() before agent_end ever fires, so that failure path needs its own
+    event shape to reach the trace at all)."""
     db = tmp_path / "sssf.db"
     conn = sqlite3.connect(db)
-    conn.execute("CREATE TABLE events (event_id TEXT, type TEXT, payload_json TEXT)")
-    for i, payload in enumerate(payloads):
-        conn.execute("INSERT INTO events VALUES (?,?,?)",
-                     (f"e{i}", "agent_end", json.dumps(payload)))
+    conn.execute("CREATE TABLE events (event_id TEXT, type TEXT, name TEXT, payload_json TEXT)")
+    for i, (etype, name, payload) in enumerate(rows):
+        conn.execute("INSERT INTO events VALUES (?,?,?,?)",
+                     (f"e{i}", etype, name, json.dumps(payload)))
     conn.commit(); conn.close()
     return db
 
@@ -128,6 +137,51 @@ def test_exhausted_windows_skips_a_non_dict_window_entry():
                               "five_hour": {"utilization": 0.99,
                                             "resetsAt": 1790100000}}}
     assert [h[0] for h in exhausted_windows(bad, 0.80, now=BEFORE_RESET)] == ["five_hour"]
+
+
+def test_last_rate_limit_finds_a_rate_limit_observed_log_row(tmp_path):
+    """review Important #5: the only reading likely to be >= max_utilization
+    (a rejected/blocked window) comes from a FAILED send, which never reaches
+    agent_end — agents.py's send() persists it as a rate_limit_observed log
+    event instead, and last_rate_limit() must find that too."""
+    from adw_modules.tracer import last_rate_limit
+    db = _db_rows(tmp_path,
+                  ("agent_end", "scout", {"cost": 0.2}),
+                  ("log", "rate_limit_observed", {"agent": "scout", "rate_limit": CAPTURED}))
+    assert last_rate_limit(db) == CAPTURED
+
+
+def test_last_rate_limit_ignores_an_unrelated_log_row(tmp_path):
+    """A rate_limit_observed row is matched by NAME, not just type='log' — an
+    ordinary console/warning log row must not be mistaken for one."""
+    from adw_modules.tracer import last_rate_limit
+    db = _db_rows(tmp_path, ("log", "coding_agent_warning", {"message": "hi"}))
+    assert last_rate_limit(db) is None
+
+
+def test_validate_refuses_using_a_rate_limit_observed_from_a_failed_send(tmp_path, monkeypatch):
+    """The headroom guard must be reachable from the failure path, not only
+    from a successful phase's agent_end — this is what makes the default of
+    1.0 mean something (review Important #5)."""
+    from adw_modules import agent_cc, agents
+    from adw_modules.data_types import SSSFConfig
+    monkeypatch.setattr(agent_cc, "preflight_auth",
+                        lambda inherit_api_key=False: {"loggedIn": True,
+                                                       "authMethod": "claude.ai"})
+    monkeypatch.setattr(agents, "_now", lambda: BEFORE_RESET)
+    sysmd, usermd = tmp_path / "s.md", tmp_path / "u.md"
+    sysmd.write_text("s"); usermd.write_text("u")
+    db = _db_rows(tmp_path,
+                  ("log", "rate_limit_observed", {"agent": "scout", "rate_limit": CAPTURED}))
+    cfg = SSSFConfig(
+        defaults={"claude_code": {"max_utilization": 0.80}},
+        observability={"db": str(db)},
+        agents=[dict(name="scout", coding_agent="claude_code",
+                     model="anthropic/claude-sonnet-5", tools=["read"],
+                     prompt_engineering={"system": str(sysmd), "user": str(usermd)})])
+    with pytest.raises(SystemExit) as e:
+        agents.validate(cfg, ["scout"])
+    assert "seven_day" in str(e.value) and "0.88" in str(e.value)
 
 
 def test_validate_does_not_check_headroom_for_a_pi_only_chain(tmp_path, monkeypatch):

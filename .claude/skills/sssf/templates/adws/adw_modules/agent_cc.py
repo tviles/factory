@@ -200,7 +200,20 @@ def preflight_auth(inherit_api_key: bool = False) -> dict:
 
 
 class CodingAgentError(RuntimeError):
-    """The coding agent failed in a way re-prompting cannot fix."""
+    """The coding agent failed in a way re-prompting cannot fix.
+
+    `rate_limit`, when set, is the `rate_limit_info` reading that caused this
+    failure. Carried on the EXCEPTION, not just left in a local variable,
+    because a raise from `run()` propagates straight out of `agents.execute()`
+    — `agent_end` only fires after gates pass and permissions.enforce()
+    succeeds — so this is the only way the one reading most likely to trip
+    `agents.py`'s headroom guard (a rejected/blocked window) can ever reach
+    the trace `validate()` reads back. See `agents.py`'s `send()`.
+    """
+
+    def __init__(self, message: str, rate_limit: Optional[dict] = None) -> None:
+        super().__init__(message)
+        self.rate_limit: dict = rate_limit or {}
 
 
 class RateLimited(CodingAgentError):
@@ -285,7 +298,7 @@ def _raise_if_overage(rl: dict, on_overage: str) -> None:
             f"the subscription is using PAID overage "
             f"(utilization={rl.get('utilization')}). Refusing to spend. Set "
             f"defaults.claude_code.on_overage: warn to allow it, or disable "
-            f"extra usage in your Anthropic account settings.")
+            f"extra usage in your Anthropic account settings.", rate_limit=rl)
 
 
 def classify(ev: dict, last_rate_limit: Optional[dict], on_overage: str) -> None:
@@ -304,7 +317,8 @@ def classify(ev: dict, last_rate_limit: Optional[dict], on_overage: str) -> None
             f"Claude Code rate limit reached: {rl.get('rateLimitType')} window "
             f"at utilization={rl.get('utilization')}, resets at "
             f"{rl.get('resetsAt')}. Not retried — a seven_day reset can be days "
-            f"away, and falling back to a per-token provider is not automatic.")
+            f"away, and falling back to a per-token provider is not automatic.",
+            rate_limit=rl)
     if not ev.get("is_error"):
         return
     text = str(ev.get("result") or "").lower()

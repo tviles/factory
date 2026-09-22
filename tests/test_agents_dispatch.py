@@ -295,6 +295,59 @@ def test_execute_forwards_warnings_to_both_the_trace_and_the_console(tmp_path, m
     run.console.note.assert_called_once_with(f"scout: {warning}")
 
 
+def test_execute_persists_rate_limit_observed_when_the_send_raises(tmp_path, monkeypatch):
+    """review Important #5: RateLimited/OverageRefused propagate straight out
+    of execute() — agent_end never fires on this path — so send() must
+    persist the observation itself, or the reading that actually trips
+    agents.py's headroom guard can never reach the trace."""
+    from adw_modules import agent_cc, agents
+    from adw_modules.data_types import AgentCall, GenericOutput
+
+    cfg = _exec_cfg(tmp_path)
+    run = _fake_run(tmp_path, cfg)
+    phase = _phase("scout")
+    rate_limit = {"status": "rejected", "rateLimitType": "seven_day",
+                  "utilization": 1.0, "resetsAt": 1790100000}
+
+    def _boom_run(request, on_event=None, on_spawn=None, on_exit=None):
+        raise agent_cc.RateLimited("rate limited", rate_limit=rate_limit)
+
+    fake_adapter = types.SimpleNamespace(run=_boom_run, ToolCallTracker=lambda: types.SimpleNamespace(observe=lambda e: []))
+    monkeypatch.setitem(agents.ADAPTERS, "claude_code", fake_adapter)
+
+    with pytest.raises(agent_cc.RateLimited):
+        agents.execute(run, phase, AgentCall(output_type=GenericOutput, prompt="go"))
+
+    observed = [c.args[0] for c in run.tracer.event.call_args_list
+               if c.args[0].name == "rate_limit_observed"]
+    assert len(observed) == 1
+    assert observed[0].type == "log"
+    assert observed[0].payload == {"agent": "scout", "rate_limit": rate_limit}
+
+
+def test_execute_does_not_persist_rate_limit_observed_on_an_ordinary_error(tmp_path, monkeypatch):
+    """An adapter error with no .rate_limit attribute (a plain pi RuntimeError,
+    or a CodingAgentError with none set) must not fabricate a reading."""
+    from adw_modules import agents
+    from adw_modules.data_types import AgentCall, GenericOutput
+
+    cfg = _exec_cfg(tmp_path)
+    run = _fake_run(tmp_path, cfg)
+    phase = _phase("scout")
+
+    def _boom_run(request, on_event=None, on_spawn=None, on_exit=None):
+        raise RuntimeError("claude exited 1")
+
+    fake_adapter = types.SimpleNamespace(run=_boom_run, ToolCallTracker=lambda: types.SimpleNamespace(observe=lambda e: []))
+    monkeypatch.setitem(agents.ADAPTERS, "claude_code", fake_adapter)
+
+    with pytest.raises(RuntimeError):
+        agents.execute(run, phase, AgentCall(output_type=GenericOutput, prompt="go"))
+
+    assert not [c.args[0] for c in run.tracer.event.call_args_list
+               if c.args[0].name == "rate_limit_observed"]
+
+
 def test_execute_records_permission_denials_in_agent_end_payload(tmp_path, monkeypatch):
     """spec §7c: --permission-prompts none silently denies anything that
     would have prompted; result.permission_denials must reach the agent_end

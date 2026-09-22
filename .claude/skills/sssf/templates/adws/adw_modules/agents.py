@@ -254,11 +254,33 @@ def execute(run, phase: Phase, call: AgentCall) -> EnvelopeBase:
             run.live_children.discard(pid)
             run.tracer.process_end(run.adw_id, pid)
 
-        result = adapter.run(
-            request,
-            on_event=_event_forwarder(run, phase, agent.name, adapter),
-            on_spawn=_on_spawn,
-            on_exit=_on_exit)
+        try:
+            result = adapter.run(
+                request,
+                on_event=_event_forwarder(run, phase, agent.name, adapter),
+                on_spawn=_on_spawn,
+                on_exit=_on_exit)
+        except Exception as error:
+            # A RateLimited/OverageRefused raised here propagates straight out
+            # of execute() — agent_end (the only other place a rate_limit
+            # reading is persisted) fires only after gates pass and
+            # permissions.enforce() succeeds, so THIS is the only path that
+            # can ever record the one reading most likely to trip agents.py's
+            # headroom guard: a rejected/blocked window. Without it, a future
+            # validate() can only ever see a reading from a SUCCESSFUL phase,
+            # and max_utilization's default of 1.0 would be all but
+            # unreachable (review Important #5). `getattr` because a plain
+            # RuntimeError or a pi RuntimeError carries no such attribute.
+            rate_limit = getattr(error, "rate_limit", None)
+            if rate_limit:
+                run.tracer.event(EventRecord(
+                    adw_id=run.adw_id, phase_id=phase.phase_id,
+                    type="log", name="rate_limit_observed",
+                    payload={"agent": agent.name, "rate_limit": rate_limit}))
+                run.console.note(
+                    f"{agent.name}: rate limit observed "
+                    f"(utilization={rate_limit.get('utilization')}) before failing")
+            raise
         resumed = True                      # every later send continues
         # `warnings` is a declared field with a default_factory on the shared
         # CodingAgentResult both adapters return — not `getattr(..., [])`,
