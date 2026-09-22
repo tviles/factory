@@ -190,3 +190,186 @@ def preflight_auth(inherit_api_key: bool = False) -> dict:
         raise ValueError(f"`claude auth status` exited {result.returncode}: "
                          f"{result.stderr.strip()[:400]}")
     return parse_auth_status(result.stdout, inherit_api_key)
+
+
+class CodingAgentError(RuntimeError):
+    """The coding agent failed in a way re-prompting cannot fix."""
+
+
+class RateLimited(CodingAgentError):
+    """Subscription window exhausted. NOT a JSON problem, NOT retryable."""
+
+
+class NotAuthenticated(CodingAgentError):
+    """The CLI is not logged in. NOT a JSON problem."""
+
+
+class OverageRefused(CodingAgentError):
+    """The subscription fell through to paid overage and we refuse to spend."""
+
+
+NOT_AUTH_SIGNATURES = ("not logged in", "please run /login", "invalid api key",
+                       "authentication_error")
+
+
+def _result_text(block_content) -> str:
+    """tool_result content is `str | list[block]`; normalise both."""
+    if isinstance(block_content, str):
+        return block_content
+    if isinstance(block_content, list):
+        return "".join(part.get("text", "") for part in block_content
+                       if isinstance(part, dict) and part.get("type") == "text")
+    return ""
+
+
+def usage_from_result(ev: dict) -> UsageBreakdown:
+    """Fold the `result` event's authoritative totals into UsageBreakdown.
+
+    `result.usage` is the total for the WHOLE send across every API call it
+    made. Per-message usage must not be summed — assistant events repeat one
+    message's usage object per content block.
+
+    Per-component COSTS stay 0: Claude Code reports only `total_cost_usd`.
+    They are unavailable, not zero, which is why the UI is changed to say so
+    rather than render four $0.0000 rows (spec §3).
+    """
+    u = ev.get("usage") or {}
+    details = u.get("output_tokens_details") or {}
+    usage = UsageBreakdown()
+    usage.input_tokens = u.get("input_tokens") or 0
+    usage.output_tokens = u.get("output_tokens") or 0
+    usage.cache_read_tokens = u.get("cache_read_input_tokens") or 0
+    usage.cache_write_tokens = u.get("cache_creation_input_tokens") or 0
+    usage.reasoning_tokens = details.get("thinking_tokens") or 0
+    # Pi's convention: cache reads count — cached prompt is still prompt.
+    usage.total_tokens = (usage.input_tokens + usage.output_tokens
+                          + usage.cache_read_tokens + usage.cache_write_tokens)
+    usage.total_cost = ev.get("total_cost_usd") or 0.0
+    return usage
+
+
+def context_window_from_result(ev: dict, model: str) -> int:
+    """The model's ceiling, straight from modelUsage. 0 = unknown."""
+    entries = ev.get("modelUsage") or {}
+    entry = entries.get(model) or next(iter(entries.values()), {})
+    return int(entry.get("contextWindow") or 0)
+
+
+def classify(ev: dict, last_rate_limit: Optional[dict], on_overage: str) -> None:
+    """Raise if this `result` event is a failure re-prompting cannot fix.
+
+    Ordered by specificity, and checked BEFORE the envelope text ever reaches
+    agents._extract_json. That ordering is the whole point: a rate-limit or
+    not-logged-in message is perfectly good TEXT, so left to fall through it
+    parses as "bad JSON", burns both correction sends against the same wall,
+    and kills the run reporting a prompt-engineering problem.
+    """
+    rl = last_rate_limit or {}
+    if rl.get("isUsingOverage") and on_overage == "fail":
+        raise OverageRefused(
+            f"the subscription is using PAID overage "
+            f"(utilization={rl.get('utilization')}). Refusing to spend. Set "
+            f"defaults.claude_code.on_overage: warn to allow it, or disable "
+            f"extra usage in your Anthropic account settings.")
+    if rl.get("status") in ("rejected", "blocked"):
+        raise RateLimited(
+            f"Claude Code rate limit reached: {rl.get('rateLimitType')} window "
+            f"at utilization={rl.get('utilization')}, resets at "
+            f"{rl.get('resetsAt')}. Not retried — a seven_day reset can be days "
+            f"away, and falling back to a per-token provider is not automatic.")
+    if not ev.get("is_error"):
+        return
+    text = str(ev.get("result") or "").lower()
+    if any(sig in text for sig in NOT_AUTH_SIGNATURES):
+        raise NotAuthenticated(
+            f"Claude Code is not authenticated: {ev.get('result')!r}. "
+            f"Run `claude auth status` to check, `claude auth login` to fix.")
+    raise CodingAgentError(
+        f"claude exited with is_error=true "
+        f"(subtype={ev.get('subtype')!r}, terminal_reason={ev.get('terminal_reason')!r}, "
+        f"api_error_status={ev.get('api_error_status')!r}): "
+        f"{str(ev.get('result'))[:500]}")
+
+
+class ToolCallTracker:
+    """Folds Claude Code's stream into ONE normalized record per tool call.
+
+    A call appears as a `tool_use` block on an assistant message and closes as
+    a `tool_result` block on a user message, joined by id. Only the result
+    carries the outcome, so that is where a record is emitted — one trace event
+    per real tool call, the moment it returns.
+
+    Also tracks context occupancy as a side effect, because the only place the
+    per-turn usage appears is on the assistant messages this already walks.
+    """
+
+    def __init__(self) -> None:
+        self._open: dict[str, dict] = {}
+        self._seen_messages: set[str] = set()
+        self.context_tokens = 0
+
+    def observe(self, event: dict) -> Optional[dict]:
+        etype = event.get("type")
+        if etype == "assistant":
+            return self._on_assistant(event)
+        if etype == "user":
+            return self._on_user(event)
+        return None
+
+    def _on_assistant(self, event: dict) -> None:
+        message = event.get("message") or {}
+        for block in message.get("content") or []:
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                self._announce(block.get("id"), block.get("name"),
+                               block.get("input") or {})
+        # Occupancy, deduped: every content block of one message re-reports the
+        # SAME usage object, so keying on message id is what stops a
+        # three-block message counting its tokens three times.
+        message_id = message.get("id")
+        usage = message.get("usage") or {}
+        if not message_id or message_id in self._seen_messages or not usage:
+            return None
+        self._seen_messages.add(message_id)
+        if message.get("stop_reason") in ("error", "aborted"):
+            return None              # an errored turn reports usage you can't trust
+        self.context_tokens = ((usage.get("input_tokens") or 0)
+                               + (usage.get("cache_creation_input_tokens") or 0)
+                               + (usage.get("cache_read_input_tokens") or 0)
+                               + (usage.get("output_tokens") or 0))
+        return None
+
+    def _on_user(self, event: dict) -> Optional[dict]:
+        for block in (event.get("message") or {}).get("content") or []:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            call_id = str(block.get("tool_use_id") or "")
+            opened = self._open.pop(call_id, {})
+            tool = str(opened.get("tool") or "tool")
+            args = opened.get("args") or {}
+            record = {
+                "tool": tool,
+                "tool_call_id": call_id,
+                "args": {k: clip(v, ARG_VALUE_CHARS) if isinstance(v, str) else v
+                         for k, v in args.items()},
+                "ok": not block.get("is_error", False),
+                "label": tool_label(tool, args),
+                "result_snippet": clip(_result_text(block.get("content")),
+                                       RESULT_SNIPPET_CHARS),
+                "ended_at": now_iso(),
+                "started_at": opened.get("started_at") or now_iso(),
+                "duration_ms": int((time.monotonic() - opened["clock"]) * 1000)
+                               if opened.get("clock") else 0,
+            }
+            if event.get("parent_tool_use_id"):
+                record["parent_tool_use_id"] = event["parent_tool_use_id"]
+            return record
+        return None
+
+    def _announce(self, call_id, tool, args) -> None:
+        if not call_id:
+            return
+        self._open[str(call_id)] = {
+            "tool": tool or "tool", "args": args or {},
+            "started_at": now_iso(),          # wall clock, for the row
+            "clock": time.monotonic(),        # monotonic, for duration
+        }
