@@ -101,8 +101,21 @@ def _context_tokens(usage: dict) -> int:
 
 
 def context_window(provider: str, model_id: str) -> int:
-    """The model's context ceiling from pi's merged model catalog."""
-    registry = json.loads(Path(MODELS_JSON).read_text())
+    """The model's context ceiling from pi's merged model catalog.
+
+    MODELS_JSON is for CUSTOM models only — a fresh `pi` install has no such
+    file, and `pi` itself works fine without one. Confirmed on a real box: a
+    stamped scratch repo's pi run died here with FileNotFoundError before pi
+    ever launched, on a machine where `pi --list-models` returns the built-in
+    catalog correctly. So a missing or malformed file is not an error here
+    either — it just means this run has no custom models, and the real
+    fallback (the `_pi_catalog()` scan below, which already knows the
+    built-ins) is what answers instead.
+    """
+    try:
+        registry = json.loads(Path(MODELS_JSON).read_text())
+    except (OSError, json.JSONDecodeError):
+        registry = {}
     for model in registry.get("providers", {}).get(provider, {}).get("models", []):
         if model.get("id") == model_id:
             return int(model.get("contextWindow") or 0)
