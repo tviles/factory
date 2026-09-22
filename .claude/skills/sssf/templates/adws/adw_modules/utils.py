@@ -130,6 +130,14 @@ def kill_tree(pid: int, grace: float = 5.0) -> None:
     else's whole process group is a far bigger mistake than failing to reap
     one child, so a non-leader gets a single-process kill instead.
     """
+    if pid <= 0:
+        # os.getpgid(0) returns the CALLER's own pgid — it is never 0, so a
+        # stray pid=0 would pass the leadership check, fall through to
+        # os.kill, and os.kill(0, SIGTERM) signals every process in this
+        # ADW's own group, including itself. A negative pid is `killpg`'s own
+        # spelling for a group id, which this function must never accept as
+        # a bare pid either.
+        return
     try:
         group = os.getpgid(pid) == pid
     except (ProcessLookupError, PermissionError):
@@ -149,18 +157,26 @@ def kill_tree(pid: int, grace: float = 5.0) -> None:
             time.sleep(0.05)
 
 
-def stderr_warnings(path: str | Path, limit: int = 20) -> list[str]:
+def stderr_warnings(path: str | Path, limit: int = 20, offset: int = 0) -> list[str]:
     """Warning/error lines from a child's stderr log, for the trace.
 
     The CLI reports real problems here that nothing in this system reads —
     `Warning: Unknown --effort value 'off' …` exits 0 and never reaches the
     trace, so a misconfigured roster looks fine. Returns [] when there is no
     log, which is the common case.
+
+    `offset` (bytes) skips content written before it. The log is one file per
+    agent-phase that every retried `send()` appends to (parse-fix and gate
+    corrections re-enter the SAME pi session by design), so without an offset
+    attempt 3's warnings would include attempts 1 and 2's — burying the
+    current attempt's own lines past `limit`, or blaming it for an old one's
+    warning entirely. Default 0 keeps every other caller's behavior unchanged.
     """
     try:
-        text = Path(path).read_text(errors="replace")
+        data = Path(path).read_bytes()[offset:]
     except OSError:
         return []
+    text = data.decode(errors="replace")
     hits = [ln.strip() for ln in text.splitlines()
             if ln.strip().startswith(("Warning:", "Error:", "warning:", "error:"))]
     return hits[:limit]

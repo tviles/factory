@@ -247,6 +247,12 @@ def run(request: PiRequest, on_event: Optional[Callable[[dict], None]] = None,
     # pipe. A file has no fixed-size buffer, so it cannot happen.
     stderr_path = raw_path.with_name("stderr.log")
     stderr_path.parent.mkdir(parents=True, exist_ok=True)
+    # Retries re-enter the SAME send() for one agent-phase (agents.py's parse
+    # fixes and gate corrections keep the same pi session, appending to this
+    # same log), so the size before THIS attempt's Popen is the offset that
+    # separates "what this attempt wrote" from what an earlier attempt left
+    # behind. Without it, a later attempt's report could show a stale cause.
+    stderr_offset = stderr_path.stat().st_size if stderr_path.exists() else 0
     with stderr_path.open("a") as err:
         process = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
                                    stdout=subprocess.PIPE, stderr=err,
@@ -286,8 +292,13 @@ def run(request: PiRequest, on_event: Optional[Callable[[dict], None]] = None,
                 on_event(event)
 
     result.returncode = process.wait()
-    stderr = "\n".join(stderr_warnings(stderr_path)) or \
-        Path(stderr_path).read_text(errors="replace")[-800:]
+    # Both, never `or`: the docstring's own motivating example — a benign
+    # `Warning: Unknown --effort value 'off'` — exits 0 and would, under `or`,
+    # suppress the tail entirely. A log holding that warning AND a fatal
+    # traceback (whose lines match none of stderr_warnings' four prefixes)
+    # would then report only the harmless line, discarding the real cause.
+    tail = stderr_path.read_bytes()[stderr_offset:][-800:].decode(errors="replace")
+    stderr = "\n".join(stderr_warnings(stderr_path, offset=stderr_offset) + [tail])
     if on_exit:
         on_exit(process.pid)
     if result.returncode != 0 and not result.text:

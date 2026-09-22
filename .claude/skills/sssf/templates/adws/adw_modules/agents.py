@@ -124,13 +124,25 @@ def execute(run, phase: Phase, call: AgentCall) -> EnvelopeBase:
             extensions=agent.harness_engineering,
             cwd=str(run.repo_root),
         )
+        def _on_spawn(pid: int) -> None:
+            # agent_pi.py spawns pi with start_new_session=True, which takes
+            # it out of this ADW's foreground process group — Ctrl-C on the
+            # ADW no longer reaches pi directly. Tracking the pid here is
+            # what makes session.py's signal handler still able to reap it.
+            run.live_children.add(pid)
+            run.tracer.process_start(
+                run.adw_id, "agent", agent.name, pid,
+                f"{agent.coding_agent} {agent.name} {agent.model}")
+
+        def _on_exit(pid: int) -> None:
+            run.live_children.discard(pid)
+            run.tracer.process_end(run.adw_id, pid)
+
         result = agent_pi.run(
             request,
             on_event=_event_forwarder(run, phase, agent.name),
-            on_spawn=lambda pid: run.tracer.process_start(
-                run.adw_id, "agent", agent.name, pid,
-                f"{agent.coding_agent} {agent.name} {agent.model}"),
-            on_exit=lambda pid: run.tracer.process_end(run.adw_id, pid))
+            on_spawn=_on_spawn,
+            on_exit=_on_exit)
         run.add_usage(result.tokens, result.cost)
         spent.merge(result.usage)
         latest = result
