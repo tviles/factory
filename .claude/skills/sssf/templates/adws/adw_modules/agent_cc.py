@@ -399,3 +399,235 @@ class ToolCallTracker:
             "started_at": now_iso(),          # wall clock, for the row
             "clock": time.monotonic(),        # monotonic, for duration
         }
+
+
+# Linux caps a SINGLE argv entry at MAX_ARG_STRLEN (128KB) regardless of how
+# much ARG_MAX headroom there is. Stay under it with room to spare; above this
+# the prompt goes to stdin instead (spec §1b).
+ARGV_SPILL_THRESHOLD = 96_000
+
+
+def build_command(request: CodingAgentRequest) -> tuple[list[str], list[str]]:
+    """Returns (argv, warnings). Pure — no subprocess, no filesystem."""
+    model = resolve_model(request.model)
+    effort, effort_warning = map_effort(request.thinking)
+    tools, warnings = map_tools(request.tools)
+    if effort_warning:
+        warnings.append(effort_warning)
+
+    cmd = [CLAUDE_PATH, "-p",
+           "--output-format", "stream-json",
+           "--verbose",                       # mandatory with stream-json
+           "--model", model,
+           "--effort", effort]
+
+    # --session-id CREATES and fails if the id exists; --resume continues.
+    # Passing both is a CLI error without --fork-session.
+    session_uuid = cc_session_uuid(request.session_id)
+    cmd += ["--resume", session_uuid] if request.resume else ["--session-id", session_uuid]
+
+    if request.system_prompt_path:
+        cmd += ["--append-system-prompt-file", request.system_prompt_path]
+    else:
+        cmd += ["--append-system-prompt", request.system_prompt]
+
+    # --tools decides what EXISTS; --allowedTools decides what needs no
+    # approval. Comma-joined into ONE argument each: both flags are variadic,
+    # so space-separated values before the positional prompt let the parser
+    # swallow the prompt as another tool name.
+    joined = ",".join(tools)
+    cmd += ["--tools", joined, "--allowedTools", joined]
+
+    # Non-blocking without being reckless: edits proceed, granted tools are
+    # pre-approved, and anything else that WOULD prompt is denied rather than
+    # hanging a headless run forever.
+    cmd += ["--permission-mode", "acceptEdits", "--permission-prompts", "none"]
+
+    # The agent runs with cwd at the repo root (permissions.enforce and session
+    # resumption both require it), so the repo's own CLAUDE.md, hooks, skills
+    # and MCP servers are in reach. Isolate the CONFIGURATION, not the cwd.
+    # NOT --bare: it reads auth strictly from ANTHROPIC_API_KEY.
+    cmd += ["--setting-sources", "", "--strict-mcp-config", "--disable-slash-commands"]
+
+    if request.restricted:
+        cmd.append("--restricted")
+
+    if len(request.prompt) > ARGV_SPILL_THRESHOLD:
+        cmd += ["--input-format", "stream-json"]
+    else:
+        cmd.append(request.prompt)
+    return cmd, warnings
+
+
+def _assert_subscription_auth(init_event: dict, inherit_api_key: bool) -> None:
+    """Cross-check, per send, that the CHILD is billing what the preflight predicted.
+
+    `preflight_auth` runs once in validate(); this fires on every run, and it
+    is the only per-run verification of the feature's core claim. Between the
+    two, a stale shell, a hook, or a bug in `claude_code_env` could still put a
+    key in front of the child.
+
+    NOTE the value semantics differ between the two surfaces, and the
+    difference is load-bearing — do not "unify" these two checks:
+
+      * `claude auth status` OMITS `apiKeySource` entirely when no key is in
+        use, so `parse_auth_status` truthy-checks it.
+      * the stream's `init` event reports the STRING `"none"` for subscription
+        auth, so this one compares against that string. A truthy check here
+        would reject every legitimate subscription run.
+    """
+    if inherit_api_key:
+        return
+    source = init_event.get("apiKeySource")
+    if source not in (None, "none"):
+        raise NotAuthenticated(
+            f"Claude Code is billing {source!r}, not your subscription, despite "
+            f"the startup preflight passing. Something put a key in front of "
+            f"the child after validate() ran. Set "
+            f"defaults.claude_code.inherit_api_key: true to allow it.")
+
+
+def _run_once(request: CodingAgentRequest,
+              on_event: Optional[Callable[[dict], None]] = None,
+              on_spawn: Optional[Callable[[int], None]] = None,
+              on_exit: Optional[Callable[[int], None]] = None) -> CodingAgentResult:
+    """Run one non-interactive Claude Code turn.
+
+    Same contract as agent_pi.run(): stream events to on_event as they happen,
+    bracket the child with on_spawn/on_exit so a hung agent is a pid the trace
+    can name, and return the shape agents.execute() already consumes.
+    """
+    cmd, warnings = build_command(request)
+    model = resolve_model(request.model)
+
+    raw_path = Path(request.raw_output_path)
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
+    stderr_path = Path(request.stderr_path or raw_path.with_name("stderr.log"))
+    stderr_path.parent.mkdir(parents=True, exist_ok=True)
+    # One log per agent-phase, appended to — but this send reads only ITS OWN
+    # bytes. `send()` is called repeatedly for one agent by design (JSON
+    # retries, gate corrections; see agents.py:105), so scanning the whole file
+    # would report a previous attempt's warnings and could show a previous
+    # attempt's crash tail. Same defect Task 2 fixed in agent_pi.py; do not
+    # reintroduce it here.
+    stderr_offset = stderr_path.stat().st_size if stderr_path.exists() else 0
+
+    result = CodingAgentResult(session_id=request.session_id, cost_basis="list")
+    tracker = ToolCallTracker()
+    last_rate_limit: Optional[dict] = None
+    result_event: Optional[dict] = None
+    spill = len(request.prompt) > ARGV_SPILL_THRESHOLD
+
+    # stderr to a FILE, never a second pipe: with both piped and a blocking
+    # stdout read, a chatty child deadlocks both sides (see agent_pi.py).
+    with stderr_path.open("a") as err:
+        process = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE if spill else subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=err, text=True, bufsize=1,
+            cwd=request.cwd, env=claude_code_env(request.inherit_api_key),
+            start_new_session=True)      # own process group, so kill_tree works
+    if on_spawn:
+        on_spawn(process.pid)
+
+    if spill:
+        # The prompt was too large for argv, so it travels as one stream-json
+        # user message. Closing stdin is what ends the turn.
+        assert process.stdin is not None
+        process.stdin.write(json.dumps({
+            "type": "user",
+            "message": {"role": "user",
+                        "content": [{"type": "text", "text": request.prompt}]},
+        }) + "\n")
+        process.stdin.close()
+
+    deadline = (time.monotonic() + request.timeout_seconds
+                if request.timeout_seconds else None)
+    try:
+        with raw_path.open("a") as raw:
+            assert process.stdout is not None
+            for line in process.stdout:
+                raw.write(line)
+                raw.flush()                  # events land on disk as they happen
+                if deadline and time.monotonic() > deadline:
+                    raise CodingAgentError(
+                        f"claude exceeded timeout_seconds="
+                        f"{request.timeout_seconds} and was killed")
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("subtype") == "init":
+                    _assert_subscription_auth(event, request.inherit_api_key)
+                elif event.get("type") == "rate_limit_event":
+                    last_rate_limit = event.get("rate_limit_info") or {}
+                elif event.get("type") == "result":
+                    result_event = event
+                tracker.observe(event)
+                if on_event:
+                    on_event(event)
+    except BaseException:
+        kill_tree(process.pid)
+        raise
+    finally:
+        if process.poll() is None:
+            kill_tree(process.pid)
+        result.returncode = process.wait()
+        if on_exit:
+            on_exit(process.pid)
+
+    result.warnings = warnings + stderr_warnings(stderr_path, offset=stderr_offset)
+
+    if result_event is None:
+        tail = stderr_path.read_bytes()[stderr_offset:][-800:].decode(errors="replace").strip()
+        raise CodingAgentError(
+            f"claude exited {result.returncode} without a result event: {tail}")
+
+    # Classify BEFORE handing any text upstream: a rate limit or a logged-out
+    # CLI is perfectly good text, and left to fall through it would parse as
+    # "bad JSON" and burn the correction budget against the same wall.
+    classify(result_event, last_rate_limit, request.on_overage)
+
+    result.text = str(result_event.get("result") or "")
+    result.usage = usage_from_result(result_event)
+    result.tokens = result.usage.total_tokens
+    result.cost = result.usage.total_cost
+    result.context_tokens = tracker.context_tokens
+    result.context_window = context_window_from_result(result_event, model)
+    if last_rate_limit:
+        result.rate_limit = last_rate_limit
+    if result.returncode != 0 and not result.text:
+        raise CodingAgentError(f"claude exited {result.returncode}")
+    return result
+
+
+SESSION_EXISTS = "already in use"
+SESSION_MISSING = ("no conversation found", "session not found")
+
+
+def run(request: CodingAgentRequest,
+        on_event: Optional[Callable[[dict], None]] = None,
+        on_spawn: Optional[Callable[[int], None]] = None,
+        on_exit: Optional[Callable[[int], None]] = None) -> CodingAgentResult:
+    """One turn, with a single create/resume correction.
+
+    Our belief about whether the session exists comes from agent_map.json,
+    which is only written after a phase SUCCEEDS — so a phase that created a
+    session and then failed leaves the map saying "new" about an id Claude
+    Code already knows, and a cleared ~/.claude leaves it saying "existing"
+    about one that is gone. Both are one retry, never a loop.
+    """
+    try:
+        return _run_once(request, on_event, on_spawn, on_exit)
+    except CodingAgentError as error:
+        text = str(error).lower()
+        if request.resume and any(sig in text for sig in SESSION_MISSING):
+            flipped = request.model_copy(update={"resume": False})
+        elif not request.resume and SESSION_EXISTS in text:
+            flipped = request.model_copy(update={"resume": True})
+        else:
+            raise
+        return _run_once(flipped, on_event, on_spawn, on_exit)

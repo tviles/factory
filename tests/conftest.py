@@ -58,7 +58,10 @@ def fake_claude(fixture_path):
     def _make(tmp_path: Path, fixture_name: str, *, exit_code: int = 0,
               stderr_text: str = "") -> Path:
         bindir = tmp_path / "fakebin"
-        bindir.mkdir(exist_ok=True)
+        # parents=True: the retry tests pass tmp_path / "a" and tmp_path / "b"
+        # as two independent fake binaries under one test's tmp_path, and
+        # neither "a" nor "b" exists yet.
+        bindir.mkdir(parents=True, exist_ok=True)
         script = bindir / "claude"
         script.write_text(
             "#!/usr/bin/env python3\n"

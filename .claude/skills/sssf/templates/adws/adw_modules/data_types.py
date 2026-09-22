@@ -413,9 +413,17 @@ class CodingAgentRequest(BaseModel):
     raw_output_path: str            # JSONL stream lands here
     stderr_path: str = ""           # child stderr; "" = beside raw_output
     tools: Optional[list[str]] = None
+    # Claude Code --restricted, set for agents with `writes: []`. Removes
+    # settings-file loading and confines file tools to the working dirs. The
+    # roster's tools survive it: --restricted only strips code-running tools
+    # that --tools does NOT name.
+    restricted: bool = False
+    # "fail" aborts the send when the subscription is on PAID overage.
+    on_overage: str = "fail"
     extensions: list[str] = Field(default_factory=list)
     cwd: str = "."                  # run.repo_root — the codebase agents work in
     timeout_seconds: int = 1800     # wall clock; 0 disables
+    inherit_api_key: bool = False
 
 
 PiRequest = CodingAgentRequest      # back-compat alias
@@ -489,6 +497,10 @@ class CodingAgentResult(BaseModel):
     # `resetsAt` are what let a later read tell a live window from one that has
     # since reset — without them the headroom check is guesswork.
     rate_limit: dict = Field(default_factory=dict)
+    # Child stderr lines worth surfacing. The CLI reports real problems here
+    # (`Warning: Unknown --effort value …`) while exiting 0, so without this
+    # the trace is blind to them.
+    warnings: list[str] = Field(default_factory=list)
 
 
 PiResult = CodingAgentResult        # back-compat alias
