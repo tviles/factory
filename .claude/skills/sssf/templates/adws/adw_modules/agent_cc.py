@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -487,6 +488,11 @@ def _assert_subscription_auth(init_event: dict, inherit_api_key: bool) -> None:
             f"defaults.claude_code.inherit_api_key: true to allow it.")
 
 
+def _stderr_tail(stderr_path: Path, offset: int) -> str:
+    """This attempt's last 800 bytes of stderr, for a failure message."""
+    return stderr_path.read_bytes()[offset:][-800:].decode(errors="replace").strip()
+
+
 def _run_once(request: CodingAgentRequest,
               on_event: Optional[Callable[[dict], None]] = None,
               on_spawn: Optional[Callable[[int], None]] = None,
@@ -516,6 +522,7 @@ def _run_once(request: CodingAgentRequest,
     tracker = ToolCallTracker()
     last_rate_limit: Optional[dict] = None
     result_event: Optional[dict] = None
+    saw_init_event = False
     spill = len(request.prompt) > ARGV_SPILL_THRESHOLD
 
     # stderr to a FILE, never a second pipe: with both piped and a blocking
@@ -530,29 +537,52 @@ def _run_once(request: CodingAgentRequest,
     if on_spawn:
         on_spawn(process.pid)
 
-    if spill:
-        # The prompt was too large for argv, so it travels as one stream-json
-        # user message. Closing stdin is what ends the turn.
-        assert process.stdin is not None
-        process.stdin.write(json.dumps({
-            "type": "user",
-            "message": {"role": "user",
-                        "content": [{"type": "text", "text": request.prompt}]},
-        }) + "\n")
-        process.stdin.close()
+    # A watchdog, not the in-loop check this replaced: the earlier version
+    # only compared the clock against a deadline WHILE handling a line, so a
+    # child that produced zero output (this module's own motivating incident
+    # — "sat idle at 0% CPU with an empty raw_output.jsonl") blocked forever
+    # in `for line in process.stdout` and the check never ran (review
+    # Important #1). A timer fires independently of whether the child ever
+    # writes; killing it closes the pipe, the blocking read returns EOF, and
+    # the loop ends on its own.
+    timed_out = threading.Event()
+    watchdog: Optional[threading.Timer] = None
+    if request.timeout_seconds:
+        def _on_timeout() -> None:
+            timed_out.set()
+            kill_tree(process.pid)
+        watchdog = threading.Timer(request.timeout_seconds, _on_timeout)
+        watchdog.daemon = True
+        watchdog.start()
 
-    deadline = (time.monotonic() + request.timeout_seconds
-                if request.timeout_seconds else None)
     try:
+        if spill:
+            # The prompt was too large for argv, so it travels as one
+            # stream-json user message. Closing stdin is what ends the turn.
+            # Inside `try` on purpose (review Important #2): a
+            # BrokenPipeError here — the ordinary outcome when the child
+            # rejects a flag and exits before ever reading stdin — used to
+            # escape with on_spawn already fired but no kill_tree, no wait(),
+            # and no on_exit, leaking the pid into Task 8's live_children
+            # forever.
+            assert process.stdin is not None
+            try:
+                process.stdin.write(json.dumps({
+                    "type": "user",
+                    "message": {"role": "user",
+                                "content": [{"type": "text", "text": request.prompt}]},
+                }) + "\n")
+                process.stdin.close()
+            except (BrokenPipeError, OSError) as error:
+                raise CodingAgentError(
+                    f"failed writing the spilled prompt to claude's stdin: "
+                    f"{error}") from error
+
         with raw_path.open("a") as raw:
             assert process.stdout is not None
             for line in process.stdout:
                 raw.write(line)
                 raw.flush()                  # events land on disk as they happen
-                if deadline and time.monotonic() > deadline:
-                    raise CodingAgentError(
-                        f"claude exceeded timeout_seconds="
-                        f"{request.timeout_seconds} and was killed")
                 line = line.strip()
                 if not line:
                     continue
@@ -561,6 +591,7 @@ def _run_once(request: CodingAgentRequest,
                 except json.JSONDecodeError:
                     continue
                 if event.get("subtype") == "init":
+                    saw_init_event = True
                     _assert_subscription_auth(event, request.inherit_api_key)
                 elif event.get("type") == "rate_limit_event":
                     last_rate_limit = event.get("rate_limit_info") or {}
@@ -573,18 +604,38 @@ def _run_once(request: CodingAgentRequest,
         kill_tree(process.pid)
         raise
     finally:
+        if watchdog:
+            watchdog.cancel()
         if process.poll() is None:
             kill_tree(process.pid)
         result.returncode = process.wait()
         if on_exit:
             on_exit(process.pid)
 
+    if timed_out.is_set():
+        raise CodingAgentError(
+            f"claude exceeded timeout_seconds="
+            f"{request.timeout_seconds} and was killed")
+
     result.warnings = warnings + stderr_warnings(stderr_path, offset=stderr_offset)
+    if not saw_init_event:
+        # `_assert_subscription_auth` is the only PER-RUN verification of the
+        # "never bills the API key" claim; `preflight_auth` only covers the
+        # static validate()-time case. A CLI that stops emitting `init`,
+        # renames the field, or moves it would otherwise skip this check by
+        # never running it — fail open silently. Surface it instead of hard
+        # failing: a legitimate run against a future CLI should not die
+        # because the check could not be performed, but it must be loud
+        # about not having been performed (review Minor #6).
+        result.warnings.append(
+            "claude never sent an init event — the per-run subscription-"
+            "billing check could not run; only the static validate()-time "
+            "check (preflight_auth) covered this send.")
 
     if result_event is None:
-        tail = stderr_path.read_bytes()[stderr_offset:][-800:].decode(errors="replace").strip()
         raise CodingAgentError(
-            f"claude exited {result.returncode} without a result event: {tail}")
+            f"claude exited {result.returncode} without a result event: "
+            f"{_stderr_tail(stderr_path, stderr_offset)}")
 
     # Classify BEFORE handing any text upstream: a rate limit or a logged-out
     # CLI is perfectly good text, and left to fall through it would parse as
@@ -600,7 +651,15 @@ def _run_once(request: CodingAgentRequest,
     if last_rate_limit:
         result.rate_limit = last_rate_limit
     if result.returncode != 0 and not result.text:
-        raise CodingAgentError(f"claude exited {result.returncode}")
+        # Same tail as the "no result event" raise above (review Minor #4):
+        # without it the retry wrapper cannot match a session signature on
+        # this branch, and the operator got "claude exited 1" with
+        # result.warnings computed and then thrown away with the exception.
+        tail = _stderr_tail(stderr_path, stderr_offset)
+        detail = f": {tail}" if tail else ""
+        if result.warnings:
+            detail += f" (warnings: {'; '.join(result.warnings)})"
+        raise CodingAgentError(f"claude exited {result.returncode}{detail}")
     return result
 
 

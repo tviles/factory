@@ -284,3 +284,196 @@ def test_run_does_not_retry_twice(tmp_path, fake_claude, monkeypatch):
     with pytest.raises(agent_cc.CodingAgentError):
         agent_cc.run(_req(tmp_path, resume=False))
     assert len(calls) == 2, "one retry, never a loop"
+
+
+# ── review fix round 1: I-1, I-2, promoted Minor 4, promoted Minor 6 ────────
+
+def test_run_raises_on_a_silent_hang(tmp_path, monkeypatch):
+    """Task 7 review Important #1: the old in-loop deadline check only ran
+    WHILE handling a line, so a child that produced zero output — this
+    module's own motivating incident, "sat idle at 0% CPU with an empty
+    raw_output.jsonl" — blocked forever in `for line in process.stdout` and
+    the check never fired. A watchdog timer, armed right after Popen and
+    independent of whether the child ever writes, is what actually catches
+    this: it kills the child, the blocking read returns EOF, and only then
+    does the loop end so the timeout can be raised.
+
+    An OUTER safety net (same pattern as agent_pi.py's
+    test_stderr_to_file_does_not_deadlock) kills the child directly if the
+    fix regresses, so a real regression fails this test fast instead of
+    hanging the whole suite.
+    """
+    import os
+    import signal
+    import threading
+    import time as _time
+    from adw_modules import agent_cc
+
+    bindir = tmp_path / "fakebin"
+    bindir.mkdir(exist_ok=True)
+    script = bindir / "claude"
+    script.write_text("#!/usr/bin/env python3\nimport time\ntime.sleep(60)\n")
+    script.chmod(0o755)
+    monkeypatch.setattr(agent_cc, "CLAUDE_PATH", str(script))
+
+    outer_timed_out = threading.Event()
+    watchdogs: list[threading.Timer] = []
+
+    def on_spawn(pid: int) -> None:
+        def _fire():
+            outer_timed_out.set()
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        timer = threading.Timer(8.0, _fire)
+        timer.daemon = True
+        timer.start()
+        watchdogs.append(timer)
+
+    request = _req(tmp_path, timeout_seconds=1)
+    started = _time.monotonic()
+    with pytest.raises(agent_cc.CodingAgentError, match="timeout_seconds"):
+        agent_cc.run(request, on_spawn=on_spawn)
+    elapsed = _time.monotonic() - started
+
+    for timer in watchdogs:
+        timer.cancel()
+    assert not outer_timed_out.is_set(), \
+        "the outer safety net had to kill the child: the production watchdog did not fire"
+    assert elapsed < 5, \
+        f"run() took {elapsed:.1f}s to detect a silent hang with timeout_seconds=1"
+
+
+def test_run_completes_with_a_spilled_prompt(tmp_path, fixture_path, monkeypatch):
+    """Task 7 review Important #2: before the fix, nothing at the run() level
+    exercised the spill path with a live child — only build_command's pure
+    argv check did. This drives a real subprocess through the >96KB path:
+    the write, the stream-json user-message envelope, and the
+    close()-ends-the-turn assumption.
+
+    The stub drains stdin before writing anything, the same way a real
+    `claude --input-format stream-json` reads the piped user message before
+    it starts replying — a stub that didn't drain it first would hit the
+    same pipe-buffer backpressure a real CLI would.
+    """
+    from adw_modules import agent_cc
+
+    bindir = tmp_path / "fakebin"
+    bindir.mkdir(exist_ok=True)
+    script = bindir / "claude"
+    fixture = fixture_path("tool_use_roundtrip.jsonl")
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys, pathlib\n"
+        f"pathlib.Path({str(bindir / 'argv.json')!r}).write_text(json.dumps(sys.argv[1:]))\n"
+        "sys.stdin.read()\n"
+        f"sys.stdout.write(pathlib.Path({str(fixture)!r}).read_text())\n"
+    )
+    script.chmod(0o755)
+    monkeypatch.setattr(agent_cc, "CLAUDE_PATH", str(script))
+
+    huge_prompt = "x" * (agent_cc.ARGV_SPILL_THRESHOLD + 1)
+    result = agent_cc.run(_req(tmp_path, prompt=huge_prompt))
+    assert result.text == "Just says hello."
+
+    argv = json.loads((bindir / "argv.json").read_text())
+    assert "--input-format" in argv
+    assert not any(len(a) > agent_cc.ARGV_SPILL_THRESHOLD for a in argv), \
+        "the huge prompt must never land in argv"
+
+
+def test_run_still_fires_on_exit_when_the_spill_write_breaks_the_pipe(
+        tmp_path, fake_claude, monkeypatch):
+    """Task 7 review Important #2: a BrokenPipeError on the spill write is
+    the ordinary outcome when the child rejects a flag and exits before ever
+    reading stdin. Before the fix it escaped with on_spawn already fired but
+    no kill_tree, no wait(), and no on_exit — Task 8's run.live_children
+    would keep that pid forever.
+
+    Deterministic: replaces only the returned process's stdin with a stub
+    that always raises, instead of racing a real child's exit against the
+    parent's write.
+    """
+    from adw_modules import agent_cc
+
+    bindir = fake_claude(tmp_path, "tool_use_roundtrip.jsonl")
+    monkeypatch.setattr(agent_cc, "CLAUDE_PATH", str(bindir / "claude"))
+    real_popen = agent_cc.subprocess.Popen
+
+    class _BrokenStdin:
+        def write(self, data):
+            raise BrokenPipeError("stub: child closed stdin")
+
+        def close(self):
+            pass
+
+    def _popen(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        process.stdin = _BrokenStdin()
+        return process
+
+    monkeypatch.setattr(agent_cc.subprocess, "Popen", _popen)
+
+    exited = []
+    huge_prompt = "x" * (agent_cc.ARGV_SPILL_THRESHOLD + 1)
+    with pytest.raises(agent_cc.CodingAgentError, match="stdin"):
+        agent_cc.run(_req(tmp_path, prompt=huge_prompt), on_exit=exited.append)
+    assert exited, "on_exit must fire even when the spill write raises BrokenPipeError"
+
+
+def test_run_nonzero_exit_with_a_result_event_still_includes_the_tail(tmp_path, monkeypatch):
+    """Promoted Minor #4: `claude exited {rc}` on this branch used to drop
+    every diagnostic — the stderr tail AND result.warnings, both already
+    computed by this point, were thrown away with the exception. This is the
+    branch reached when a result event DID arrive (so the "no result event"
+    raise does not fire) but returncode is non-zero and result.text is empty.
+    """
+    from adw_modules import agent_cc
+
+    events = [{"type": "result", "subtype": "success", "is_error": False,
+              "result": "", "usage": {}, "total_cost_usd": 0.0}]
+    fixture = tmp_path / "empty_result.jsonl"
+    fixture.write_text("\n".join(json.dumps(e) for e in events) + "\n")
+    bindir = tmp_path / "fakebin"
+    bindir.mkdir(exist_ok=True)
+    script = bindir / "claude"
+    script.write_text(
+        "#!/usr/bin/env python3\nimport sys, pathlib\n"
+        "sys.stderr.write('Warning: something odd\\n')\n"
+        f"sys.stdout.write(pathlib.Path({str(fixture)!r}).read_text())\n"
+        "sys.exit(2)\n"
+    )
+    script.chmod(0o755)
+    monkeypatch.setattr(agent_cc, "CLAUDE_PATH", str(script))
+
+    with pytest.raises(agent_cc.CodingAgentError) as exc_info:
+        agent_cc.run(_req(tmp_path))
+    message = str(exc_info.value)
+    assert "claude exited 2" in message
+    assert "something odd" in message, "the stderr tail must survive into the raise"
+
+
+def test_run_warns_when_no_init_event_arrives(tmp_path, fixture_path, monkeypatch):
+    """Promoted Minor #6: `_assert_subscription_auth` is the only PER-RUN
+    verification that the child is billing the subscription, not an API key.
+    It only runs on an event with subtype=='init' — if a future CLI stops
+    emitting one, renames the field, or moves it, the check must not
+    silently pass by never running; it must say so in result.warnings."""
+    from adw_modules import agent_cc
+
+    events = [json.loads(l) for l in fixture_path("tool_use_roundtrip.jsonl")
+              .read_text().splitlines() if l.strip()]
+    events = [e for e in events if e.get("subtype") != "init"]
+    doctored = tmp_path / "no_init.jsonl"
+    doctored.write_text("\n".join(json.dumps(e) for e in events) + "\n")
+    bindir = tmp_path / "fakebin"
+    bindir.mkdir(exist_ok=True)
+    script = bindir / "claude"
+    script.write_text("#!/usr/bin/env python3\nimport sys,pathlib\n"
+                      f"sys.stdout.write(pathlib.Path({str(doctored)!r}).read_text())\n")
+    script.chmod(0o755)
+    monkeypatch.setattr(agent_cc, "CLAUDE_PATH", str(script))
+
+    result = agent_cc.run(_req(tmp_path))
+    assert any("init event" in w for w in result.warnings)
