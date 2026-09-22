@@ -17,18 +17,13 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from .data_types import PiRequest, PiResult
-from .utils import now_iso, operator_env, stderr_warnings
+from .utils import (ARG_VALUE_CHARS, LABEL_CHARS, PRIMARY_ARGS,
+                    RESULT_SNIPPET_CHARS, clip as _clip, now_iso, operator_env,
+                    stderr_warnings, tool_label as _label)
 
 PI_PATH = os.environ.get("PI_PATH", "pi")
 MODELS_JSON = os.environ.get("PI_MODELS_PATH",
                              str(Path.home() / ".pi" / "agent" / "models.json"))
-
-RESULT_SNIPPET_CHARS = 20_000   # tool output rides along whole; clip only guards pathological cases
-ARG_VALUE_CHARS = 20_000        # args too — the UI scrolls, it must not be handed cut-off data
-LABEL_CHARS = 80                # "bash: <command>" shown as the event name
-
-# The arg that identifies a call at a glance, in the order tools tend to use.
-PRIMARY_ARGS = ("command", "path", "file_path", "pattern", "query", "url")
 
 
 def _count(value: str) -> int:
@@ -122,20 +117,6 @@ def _text_of(container: dict) -> str:
     message or a tool result."""
     return "".join(part.get("text", "") for part in container.get("content", []) or []
                    if isinstance(part, dict) and part.get("type") == "text")
-
-
-def _clip(text: str, limit: int) -> str:
-    return text if len(text) <= limit else text[:limit].rstrip() + "…"
-
-
-def _label(tool: str, args: dict) -> str:
-    """One-line human name for a tool call: `bash: ls -la src`."""
-    value = next((args[key] for key in PRIMARY_ARGS
-                  if isinstance(args.get(key), str) and args[key].strip()), "")
-    if not value:
-        value = next((v for v in args.values() if isinstance(v, str) and v.strip()), "")
-    value = " ".join(str(value).split())
-    return f"{tool}: {_clip(value, LABEL_CHARS)}" if value else tool
 
 
 class ToolCallTracker:
@@ -245,7 +226,8 @@ def run(request: PiRequest, on_event: Optional[Callable[[dict], None]] = None,
     # stderr, stops producing stdout, and both sides wait forever — the same
     # silent 0%-CPU hang the stdin comment below describes, through the other
     # pipe. A file has no fixed-size buffer, so it cannot happen.
-    stderr_path = raw_path.with_name("stderr.log")
+    stderr_path = Path(request.stderr_path) if request.stderr_path else \
+        raw_path.with_name("stderr.log")
     stderr_path.parent.mkdir(parents=True, exist_ok=True)
     # Retries re-enter the SAME send() for one agent-phase (agents.py's parse
     # fixes and gate corrections keep the same pi session, appending to this

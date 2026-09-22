@@ -322,6 +322,23 @@ class AgentConfig(BaseModel):
     writes: Optional[list[str]] = None
 
 
+class ClaudeCodeDefaults(BaseModel):
+    """Knobs that only mean something for coding_agent: claude_code."""
+
+    # False strips ANTHROPIC_API_KEY et al from the child env, which is what
+    # keeps a run on the Max subscription instead of per-token API billing.
+    inherit_api_key: bool = False
+    timeout_seconds: int = 1800
+    # A subscription past its limits falls through to PAID overage. "fail"
+    # aborts the moment that is observed; "warn" logs and continues.
+    on_overage: Literal["fail", "warn"] = "fail"
+    # Refuse to START a chain when a LIVE rate-limit window was last observed
+    # at or above this utilisation. 1.0 (the default) refuses only a window
+    # read as fully exhausted — which can never be a false alarm, because a
+    # recorded utilisation is a lower bound until its resetsAt passes.
+    max_utilization: float = 1.0
+
+
 class ConfigDefaults(BaseModel):
     coding_agent: Literal["pi", "claude_code"] = "pi"
     model: str = "google/gemini-3.6-flash"
@@ -336,6 +353,7 @@ class ConfigDefaults(BaseModel):
         "adws/adw_modules/", "adws/adw_sssf_config/", "adws/adw_*.py",
     ])
     data_dir: str = "adws/adw_data"
+    claude_code: ClaudeCodeDefaults = Field(default_factory=ClaudeCodeDefaults)
 
 
 class ObservabilityConfig(BaseModel):
@@ -370,19 +388,37 @@ class EventRecord(BaseModel):
 
 # ── Pi coding agent interface ────────────────────────────────────────────────
 
-class PiRequest(BaseModel):
-    """Everything one non-interactive pi run needs."""
+class CodingAgentRequest(BaseModel):
+    """Everything one non-interactive coding-agent turn needs.
+
+    One type for both adapters. Fields a given harness cannot use are inert
+    there rather than duplicated into a parallel type: Pi ignores `resume`
+    because `--session-id` already creates-or-continues, and Claude Code
+    ignores `session_dir` because it stores transcripts under its own
+    projects directory (spec §2).
+    """
 
     prompt: str
-    system_prompt: str
-    model: str                      # registry pattern, resolved to provider + id
+    system_prompt: str              # rendered text — Pi passes this in argv
+    # The same text, already on disk at {agent_dir}/prompts/system.md. Claude
+    # Code takes --append-system-prompt-file, which keeps the largest argument
+    # out of argv AND makes the audit copy literally the bytes that were sent.
+    system_prompt_path: str = ""
+    model: str                      # provider/model-id
     thinking: str = "medium"
-    session_id: str                 # pi --session-id: creates or continues
-    session_dir: str
+    session_id: str                 # sssf id; Claude Code maps it to a uuid
+    # False = create the session, True = continue it. Pi ignores this.
+    resume: bool = False
+    session_dir: str = ""           # Pi only
     raw_output_path: str            # JSONL stream lands here
+    stderr_path: str = ""           # child stderr; "" = beside raw_output
     tools: Optional[list[str]] = None
     extensions: list[str] = Field(default_factory=list)
-    cwd: str = "."                  # set from run.repo_root — the codebase root agents work in
+    cwd: str = "."                  # run.repo_root — the codebase agents work in
+    timeout_seconds: int = 1800     # wall clock; 0 disables
+
+
+PiRequest = CodingAgentRequest      # back-compat alias
 
 
 class UsageBreakdown(BaseModel):
@@ -433,7 +469,7 @@ class UsageBreakdown(BaseModel):
             setattr(self, field, getattr(self, field) + getattr(other, field))
 
 
-class PiResult(BaseModel):
+class CodingAgentResult(BaseModel):
     text: str = ""
     returncode: int = 0
     session_id: str = ""
@@ -445,3 +481,14 @@ class PiResult(BaseModel):
     # visualizer's context bar measures against `context_window`.
     context_tokens: int = 0
     context_window: int = 0         # 0 when the registry declares no ceiling
+    # "billed" (pi: real money) vs "list" (claude_code on a subscription:
+    # notional list price). The UI must not present the two the same way.
+    cost_basis: str = "billed"
+    # The last rate_limit_event's `rate_limit_info`, verbatim. Stored whole
+    # rather than as a bare utilisation float because `unifiedWindows` and
+    # `resetsAt` are what let a later read tell a live window from one that has
+    # since reset — without them the headroom check is guesswork.
+    rate_limit: dict = Field(default_factory=dict)
+
+
+PiResult = CodingAgentResult        # back-compat alias
