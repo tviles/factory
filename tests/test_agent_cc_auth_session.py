@@ -19,6 +19,14 @@ PRO = json.dumps({
     "loggedIn": True, "authMethod": "claude.ai", "apiProvider": "firstParty",
     "projectsDirectory": "/Users/x/.claude/projects", "subscriptionType": "pro"})
 
+# `claude auth status` never emits this string itself (it omits the key
+# entirely) — but the stream's `init` event does, for the same "no API key"
+# state. Asserting it here pins the asymmetry the guard has to tolerate.
+SUBSCRIPTION_WITH_NONE_KEY_SOURCE = json.dumps({
+    "loggedIn": True, "authMethod": "claude.ai", "apiProvider": "firstParty",
+    "projectsDirectory": "/Users/x/.claude/projects",
+    "apiKeySource": "none", "subscriptionType": "max"})
+
 
 def test_parse_auth_status_accepts_a_subscription():
     from adw_modules.agent_cc import parse_auth_status
@@ -32,6 +40,14 @@ def test_parse_auth_status_accepts_pro_because_plan_name_is_never_gated_on():
     would fail a Pro seat, a Team seat, or any renamed plan."""
     from adw_modules.agent_cc import parse_auth_status
     assert parse_auth_status(PRO, inherit_api_key=False)["subscriptionType"] == "pro"
+
+
+def test_parse_auth_status_accepts_api_key_source_none_as_absent():
+    """apiKeySource: "none" means "no API key in use" on this surface, not
+    "an API key named none" — it must pass exactly like an omitted key."""
+    from adw_modules.agent_cc import parse_auth_status
+    info = parse_auth_status(SUBSCRIPTION_WITH_NONE_KEY_SOURCE, inherit_api_key=False)
+    assert info["subscriptionType"] == "max"
 
 
 def test_parse_auth_status_rejects_logged_out():

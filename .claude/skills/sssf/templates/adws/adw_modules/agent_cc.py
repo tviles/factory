@@ -154,7 +154,13 @@ def parse_auth_status(raw: str, inherit_api_key: bool) -> dict:
         raise ValueError("Claude Code is not logged in — run `claude auth login`. "
                          "(`claude auth status` reports loggedIn: false)")
     if not inherit_api_key:
-        if info.get("apiKeySource"):
+        # `claude auth status` OMITS apiKeySource entirely when no API key is
+        # in use, so a falsy check is correct for THIS surface. The stream's
+        # `init` event instead reports the literal string "none" for the same
+        # state — if the two ever converge, a bare truthy check would reject
+        # every legitimate subscription user. Treat "none" as absent too;
+        # do not "simplify" this back to one check across both surfaces.
+        if info.get("apiKeySource") and info.get("apiKeySource") != "none":
             raise ValueError(
                 f"Claude Code would bill the API, not your subscription: "
                 f"apiKeySource={info['apiKeySource']!r}. Unset it, or set "
