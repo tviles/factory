@@ -2697,13 +2697,27 @@ In `agents.execute()`, replace the session id line and the `send` closure:
         return result
 ```
 
-Change `_event_forwarder` to take the adapter so each harness folds its own stream:
+Change `_event_forwarder` to take the adapter so each harness folds its own
+stream, and to **iterate** the tracker's result. Both trackers return
+`list[dict]` as of Task 6's fix round — a single `Optional[dict]` could not
+express "N records from one event", which silently dropped a row whenever one
+`user` event carried two `tool_result` blocks (Claude Code batches parallel
+tool calls):
 
 ```python
 def _event_forwarder(run, phase: Phase, agent_name: str, adapter):
     """One tool_call event per real tool call, with its exact args and result."""
     tracker = adapter.ToolCallTracker()
-    ...
+
+    def forward(event: dict) -> None:
+        for record in tracker.observe(event):      # list, never a bare record
+            run.tracer.event(EventRecord(
+                adw_id=run.adw_id, phase_id=phase.phase_id,
+                type="tool_call", name=record.pop("label"),
+                started_at=record.pop("started_at", None),
+                ended_at=record.pop("ended_at", None),
+                payload={**record, "agent": agent_name}))
+    return forward
 ```
 
 Import `CodingAgentRequest` in `agents.py`'s `data_types` import list.
