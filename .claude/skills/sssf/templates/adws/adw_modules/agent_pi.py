@@ -165,6 +165,50 @@ def _text_of(container: dict) -> str:
                    if isinstance(part, dict) and part.get("type") == "text")
 
 
+class ProviderError(RuntimeError):
+    """The PROVIDER refused/errored on a turn — not a malformed-JSON problem.
+
+    Real incident: a run against google/gemini-3.6-flash did real work (ls,
+    read x3, find, write — it even wrote its findings file), then the
+    provider returned an HTTP 429 (quota exhausted) on the final turn, three
+    times (initial send + both JSON-correction retries). Each errored turn's
+    `message_end` carried empty text, so the OLD code treated it as malformed
+    JSON, burned both corrections against a wall retrying could not fix, and
+    finally raised "scout never produced valid GenericOutput JSON: no JSON
+    object found in the response" — blaming the agent's formatting for a
+    provider outage. pi already reports `stopReason: "error"` plus a
+    populated `errorMessage` on exactly this event; it was just unused.
+
+    Mirrors agent_cc.classify()/CodingAgentError in spirit — raised BEFORE
+    the response text ever reaches agents._extract_json, so a 429 (or any
+    other provider-side refusal) is reported as what it is instead of being
+    misdiagnosed as bad JSON. Not the same machinery: agent_cc classifies off
+    a dedicated `rate_limit_event`/`result` event; pi has no equivalent
+    stream shape, so this reads the same signal off the assistant
+    `message_end` pi already emits.
+    """
+
+
+def _provider_error_text(raw: str) -> str:
+    """pi's `errorMessage` is often itself a JSON-encoded provider error body
+    — e.g. `{"error":{"message":"...429 ... You exceeded your current
+    quota..."}}`. Extract the inner message so the operator sees the
+    provider's own words, not a wrapped JSON blob; fall back to the raw
+    string when it is not that shape (or not JSON at all)."""
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return text
+    if isinstance(parsed, dict):
+        inner = parsed.get("error")
+        if isinstance(inner, dict) and inner.get("message"):
+            return str(inner["message"])
+    return text
+
+
 class ToolCallTracker:
     """Folds pi's tool stream into ONE normalized record per completed call.
 
@@ -268,6 +312,13 @@ def run(request: PiRequest, on_event: Optional[Callable[[dict], None]] = None,
 
     result = PiResult(session_id=request.session_id,
                       context_window=context_window(provider, model_id))
+    # The last assistant turn's stopReason/errorMessage, so a run that ends
+    # with no usable text can tell "the provider refused" (stopReason ==
+    # "error", ProviderError below) from "the model just wrote something
+    # unparseable" (any other reason, left to agents._parse_with_retries
+    # exactly as before).
+    last_stop_reason = ""
+    last_error_message = ""
     # stdin is DEVNULL, deliberately. The prompt travels in argv, so the child
     # never needs stdin — but inheriting the parent's means pi sees a non-TTY
     # and can sit forever waiting for piped input that will never arrive or
@@ -330,9 +381,16 @@ def run(request: PiRequest, on_event: Optional[Callable[[dict], None]] = None,
                         # Occupancy is read off the last VALID assistant turn, the
                         # way pi does it — an aborted or errored turn reports usage
                         # you can't trust, so it must not overwrite a good reading.
-                        if turn and message.get("stopReason") not in ("aborted", "error"):
+                        stop_reason = message.get("stopReason") or ""
+                        if turn and stop_reason not in ("aborted", "error"):
                             result.context_tokens = turn
                         result.cost += (usage.get("cost", {}) or {}).get("total", 0.0) or 0.0
+                        # Tracks the LAST assistant turn seen, error or not —
+                        # ProviderError below only fires when that last turn
+                        # errored AND left no usable text.
+                        last_stop_reason = stop_reason
+                        if stop_reason == "error":
+                            last_error_message = message.get("errorMessage") or last_error_message
                 if on_event:
                     on_event(event)
     except BaseException:
@@ -368,6 +426,21 @@ def run(request: PiRequest, on_event: Optional[Callable[[dict], None]] = None,
     # would then report only the harmless line, discarding the real cause.
     tail = stderr_path.read_bytes()[stderr_offset:][-800:].decode(errors="replace")
     stderr = "\n".join(stderr_warnings(stderr_path, offset=stderr_offset) + [tail])
+    # Checked BEFORE the returncode branch below, and independent of
+    # returncode: the motivating incident's `pi` process exited 0 — nothing
+    # crashed, one turn was just refused by the provider. Left unchecked, an
+    # empty result.text here flows into agents._extract_json, which reports
+    # "no JSON object found in the response" and burns both JSON-correction
+    # attempts against a wall retrying cannot fix (see ProviderError's
+    # docstring). Only fires when there is genuinely NO usable text; a run
+    # whose last turn errored but which still produced text from an earlier
+    # turn is left alone, same as today.
+    if not result.text.strip() and last_stop_reason == "error":
+        detail = _provider_error_text(last_error_message)
+        raise ProviderError(
+            "pi's provider turn ended in error rather than a response"
+            f"{': ' + detail if detail else ''} — this is a provider-side "
+            f"failure, not malformed JSON; not retried as one")
     if result.returncode != 0 and not result.text:
         raise RuntimeError(f"pi exited {result.returncode}: {stderr.strip()[-800:]}")
     return result
