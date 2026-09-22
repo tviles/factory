@@ -421,6 +421,25 @@ class AgentSessionRecord(BaseModel):
     cost_basis: str = "billed"      # 'billed' (real money) | 'list' (subscription notional)
 
 
+class EnvelopeRecord(BaseModel):
+    """Everything tracer.envelope_row() needs. One object, never loose params.
+
+    A row is written on every parse attempt, valid or not — `_parse_with_retries`'s
+    correction loop calls this on each failed attempt too, so a run's envelope
+    history shows every retry, not just the one that finally validated. That was
+    six loose params (phase, agent, output_type, payload_json, valid, attempt);
+    the same hard-rule-4 violation `dafa60b` fixed for agent_session_row and
+    process_start, surveyed then and left for a follow-up rather than bundled in.
+    """
+
+    phase: Phase
+    agent: str
+    output_type: str
+    payload_json: str
+    valid: bool
+    attempt: int
+
+
 # ── Pi coding agent interface ────────────────────────────────────────────────
 
 class CodingAgentRequest(BaseModel):

@@ -12,8 +12,8 @@ import sqlite3
 from pathlib import Path
 from typing import Optional
 
-from .data_types import (AgentSessionRecord, EventRecord, GateReport, Phase,
-                         ProcessRecord)
+from .data_types import (AgentSessionRecord, EnvelopeRecord, EventRecord,
+                         GateReport, Phase, ProcessRecord)
 from .utils import ensure_dir, new_id, now_iso
 
 SCHEMA = """
@@ -280,13 +280,13 @@ class Tracer:
         )
 
     # ── envelopes / gates / agent sessions ──────────────────────────────────
-    def envelope_row(self, phase: Phase, agent: str, output_type: str,
-                     payload_json: str, valid: bool, attempt: int) -> None:
+    def envelope_row(self, record: EnvelopeRecord) -> None:
         self.conn.execute(
             "INSERT INTO envelopes (envelope_id, adw_id, phase_id, agent, output_type,"
             " payload_json, valid, attempt, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
-            (f"env_{new_id(12)}", phase.adw_id, phase.phase_id, agent, output_type,
-             payload_json, int(valid), attempt, now_iso()),
+            (f"env_{new_id(12)}", record.phase.adw_id, record.phase.phase_id,
+             record.agent, record.output_type, record.payload_json,
+             int(record.valid), record.attempt, now_iso()),
         )
 
     def gate_row(self, phase: Phase, gate: str, report: GateReport, attempt: int) -> None:

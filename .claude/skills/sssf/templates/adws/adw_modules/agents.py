@@ -21,8 +21,8 @@ from . import agent_cc, agent_pi, permissions, prompts
 from . import tracer as tracer_mod
 from .data_types import (AgentCall, AgentConfig, AgentSessionRecord,
                          CodingAgentRequest, CodingAgentResult, EnvelopeBase,
-                         EventRecord, GateCheck, GateReport, Phase,
-                         ProcessRecord, SSSFConfig, UsageBreakdown)
+                         EnvelopeRecord, EventRecord, GateCheck, GateReport,
+                         Phase, ProcessRecord, SSSFConfig, UsageBreakdown)
 from .utils import new_id
 
 JSON_FIX_ATTEMPTS = 2      # continue-with-correction attempts for malformed JSON
@@ -488,8 +488,9 @@ def _persist_envelope(run, phase: Phase, agent_name: str, call: AgentCall,
                       envelope: Optional[EnvelopeBase], attempt: int,
                       valid: bool, raw: str = "") -> None:
     payload_json = envelope.model_dump_json(indent=2) if envelope else json.dumps({"raw": raw[-2000:]})
-    run.tracer.envelope_row(phase, agent_name, call.output_type.__name__,
-                            payload_json, valid, attempt)
+    run.tracer.envelope_row(EnvelopeRecord(
+        phase=phase, agent=agent_name, output_type=call.output_type.__name__,
+        payload_json=payload_json, valid=valid, attempt=attempt))
     if envelope:
         record = {"agent_name": agent_name, "purpose": resolve(run.cfg, agent_name).purpose,
                   "output_type": call.output_type.__name__, "attempt": attempt,

@@ -77,6 +77,41 @@ def test_process_start_persists_command_for_pid_reuse_safety(tmp_path):
     assert row == ("agent", "scout", 4242, "claude_code scout gemini")
 
 
+def _phase(adw_id="adw1"):
+    from adw_modules.data_types import Phase, PhaseParams
+    params = PhaseParams(name="build", kind="agent", owner="scout",
+                         description="test phase")
+    return Phase(phase_id=f"{adw_id}_01_build", adw_id=adw_id, seq=1,
+                params=params, status="running")
+
+
+def test_envelope_row_takes_one_object(tmp_path):
+    """Same rule, same shape — envelope_row (phase, agent, output_type,
+    payload_json, valid, attempt) was six loose params, surveyed alongside
+    agent_session_row and process_start in dafa60b and left for a follow-up
+    rather than bundled in. It must accept exactly one positional param
+    (record) besides self."""
+    from adw_modules.tracer import Tracer
+    params = list(inspect.signature(Tracer.envelope_row).parameters)
+    assert params == ["self", "record"]
+
+
+def test_envelope_row_persists_all_fields(tmp_path):
+    """The move to EnvelopeRecord must not silently drop or default a field
+    an existing caller relies on."""
+    from adw_modules.data_types import EnvelopeRecord
+    t = _tracer(tmp_path)
+    t.session_start("adw1", "eng")
+    t.envelope_row(EnvelopeRecord(
+        phase=_phase("adw1"), agent="scout", output_type="GenericOutput",
+        payload_json='{"status": "success"}', valid=True, attempt=1))
+    row = t.conn.execute(
+        "SELECT adw_id, phase_id, agent, output_type, payload_json, valid,"
+        " attempt FROM envelopes WHERE adw_id='adw1'").fetchone()
+    assert row == ("adw1", "adw1_01_build", "scout", "GenericOutput",
+                   '{"status": "success"}', 1, 1)
+
+
 def test_migration_adds_the_column_to_an_older_db(tmp_path):
     """A db from an older SSSF must still open. CREATE TABLE IF NOT EXISTS
     never revisits an existing table, hence the explicit ALTER list."""
