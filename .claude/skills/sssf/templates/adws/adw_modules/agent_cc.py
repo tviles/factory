@@ -307,6 +307,14 @@ class ToolCallTracker:
 
     Also tracks context occupancy as a side effect, because the only place the
     per-turn usage appears is on the assistant messages this already walks.
+
+    `observe` returns a LIST, not `Optional[dict]`: Claude Code can batch
+    parallel tool calls into one `user` event carrying several `tool_result`
+    blocks, and a single-value return can only ever surface the first one —
+    every later block in that event would be silently dropped from the trace
+    AND leak its `_open` entry forever (review Task 6 I-2). `agent_pi`'s
+    tracker shares this contract; its results really are one-at-a-time, so it
+    just wraps its single record as `[record]`.
     """
 
     def __init__(self) -> None:
@@ -314,13 +322,14 @@ class ToolCallTracker:
         self._seen_messages: set[str] = set()
         self.context_tokens = 0
 
-    def observe(self, event: dict) -> Optional[dict]:
+    def observe(self, event: dict) -> list[dict]:
         etype = event.get("type")
         if etype == "assistant":
-            return self._on_assistant(event)
+            self._on_assistant(event)
+            return []
         if etype == "user":
             return self._on_user(event)
-        return None
+        return []
 
     def _on_assistant(self, event: dict) -> None:
         message = event.get("message") or {}
@@ -344,7 +353,13 @@ class ToolCallTracker:
                                + (usage.get("output_tokens") or 0))
         return None
 
-    def _on_user(self, event: dict) -> Optional[dict]:
+    def _on_user(self, event: dict) -> list[dict]:
+        # A list, not "return on first match": Claude Code CAN close several
+        # parallel tool calls in ONE user event (one tool_result block each),
+        # and returning early left every block after the first neither
+        # emitted nor popped from `self._open` — a silently dropped trace row
+        # AND a leaked open-call entry for the life of the run.
+        records = []
         for block in (event.get("message") or {}).get("content") or []:
             if not isinstance(block, dict) or block.get("type") != "tool_result":
                 continue
@@ -368,8 +383,8 @@ class ToolCallTracker:
             }
             if event.get("parent_tool_use_id"):
                 record["parent_tool_use_id"] = event["parent_tool_use_id"]
-            return record
-        return None
+            records.append(record)
+        return records
 
     def _announce(self, call_id, tool, args) -> None:
         if not call_id:

@@ -249,16 +249,18 @@ def _event_forwarder(run, phase: Phase, agent_name: str):
     tracker = agent_pi.ToolCallTracker()
 
     def forward(event: dict) -> None:
-        record = tracker.observe(event)
-        if record is None:
-            return
-        # The call's span rides the columns; duration_ms stays in the payload as
-        # pi's own authoritative number.
-        run.tracer.event(EventRecord(adw_id=run.adw_id, phase_id=phase.phase_id,
-                                     type="tool_call", name=record.pop("label"),
-                                     started_at=record.pop("started_at", None),
-                                     ended_at=record.pop("ended_at", None),
-                                     payload={**record, "agent": agent_name}))
+        # observe() returns a LIST: one event can close several parallel tool
+        # calls at once (agent_cc's tracker shares this contract for exactly
+        # that reason — see agent_cc.ToolCallTracker's docstring), so every
+        # record it hands back must be traced, not just the first.
+        for record in tracker.observe(event):
+            # The call's span rides the columns; duration_ms stays in the payload as
+            # pi's own authoritative number.
+            run.tracer.event(EventRecord(adw_id=run.adw_id, phase_id=phase.phase_id,
+                                         type="tool_call", name=record.pop("label"),
+                                         started_at=record.pop("started_at", None),
+                                         ended_at=record.pop("ended_at", None),
+                                         payload={**record, "agent": agent_name}))
     return forward
 
 

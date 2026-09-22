@@ -135,21 +135,28 @@ class ToolCallTracker:
     def __init__(self) -> None:
         self._open: dict[str, dict] = {}
 
-    def observe(self, event: dict) -> Optional[dict]:
-        """Returns the record for a finished tool call, else None."""
+    def observe(self, event: dict) -> list[dict]:
+        """Returns every record a finished tool call in this event completed.
+
+        List, not `Optional[dict]`, to share one contract with
+        `agent_cc.ToolCallTracker` — whose stream CAN close several parallel
+        tool calls in one event, so its version genuinely needs multiple
+        results per `observe()` call. Pi's own events only ever complete one
+        call each, so this side just wraps that single record.
+        """
         etype = event.get("type", "")
         if etype == "message_end":
             for block in event.get("message", {}).get("content", []) or []:
                 if isinstance(block, dict) and block.get("type") == "toolCall":
                     self._announce(block.get("id"), block.get("name"),
                                    block.get("arguments"))
-            return None
+            return []
         if etype == "tool_execution_start":
             self._announce(event.get("toolCallId"), event.get("toolName"),
                            event.get("args"))
-            return None
+            return []
         if etype != "tool_execution_end":
-            return None
+            return []
 
         call_id = str(event.get("toolCallId") or "")
         opened = self._open.pop(call_id, {})
@@ -171,7 +178,7 @@ class ToolCallTracker:
             record["duration_ms"] = int((time.monotonic() - opened["clock"]) * 1000)
         if opened.get("started_at"):
             record["started_at"] = opened["started_at"]
-        return record
+        return [record]
 
     def _announce(self, call_id, tool, args) -> None:
         """First sighting starts the clock; a later sighting only fills gaps."""

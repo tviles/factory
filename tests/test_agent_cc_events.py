@@ -13,8 +13,9 @@ def _result_event(fixture):
 def test_tracker_folds_a_tool_use_and_tool_result_into_one_record(fixture):
     from adw_modules.agent_cc import ToolCallTracker
     tracker = ToolCallTracker()
-    records = [r for e in fixture("tool_use_roundtrip.jsonl")
-               if (r := tracker.observe(e)) is not None]
+    records = []
+    for e in fixture("tool_use_roundtrip.jsonl"):
+        records.extend(tracker.observe(e))
     assert len(records) == 1
     rec = records[0]
     assert rec["tool"] == "Read"
@@ -31,8 +32,10 @@ def test_tracker_payload_carries_every_contract_key(fixture):
     """spec §1.2: tool_call rows need exactly these."""
     from adw_modules.agent_cc import ToolCallTracker
     tracker = ToolCallTracker()
-    rec = next(r for e in fixture("tool_use_roundtrip.jsonl")
-               if (r := tracker.observe(e)) is not None)
+    records = []
+    for e in fixture("tool_use_roundtrip.jsonl"):
+        records.extend(tracker.observe(e))
+    rec = records[0]
     for key in ("tool", "tool_call_id", "args", "result_snippet", "ok",
                 "duration_ms", "label", "started_at", "ended_at"):
         assert key in rec, f"missing {key}"
@@ -44,12 +47,34 @@ def test_tracker_handles_parallel_tool_uses_in_one_message():
     assert tracker.observe({"type": "assistant", "message": {"content": [
         {"type": "tool_use", "id": "a", "name": "Read", "input": {"file_path": "/a"}},
         {"type": "tool_use", "id": "b", "name": "Bash", "input": {"command": "ls"}},
-    ]}}) is None
+    ]}}) == []
     rb = tracker.observe({"type": "user", "message": {"content": [
         {"type": "tool_result", "tool_use_id": "b", "content": "out"}]}})
     ra = tracker.observe({"type": "user", "message": {"content": [
         {"type": "tool_result", "tool_use_id": "a", "content": "x"}]}})
-    assert rb["tool"] == "Bash" and ra["tool"] == "Read"
+    assert rb[0]["tool"] == "Bash" and ra[0]["tool"] == "Read"
+
+
+def test_tracker_returns_every_completed_call_when_one_event_carries_several():
+    """Synthetic event: no fixture shows this shape (all four captures put one
+    tool_result per user event), but Claude Code CAN close a parallel tool
+    batch in a single event — review Task 6 I-2. observe() must emit every
+    completed call from that one event, not just the first, and must not
+    leave the later ones stuck open."""
+    from adw_modules.agent_cc import ToolCallTracker
+    tracker = ToolCallTracker()
+    tracker.observe({"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": "a", "name": "Read", "input": {"file_path": "/a"}},
+        {"type": "tool_use", "id": "b", "name": "Bash", "input": {"command": "ls"}},
+    ]}})
+    records = tracker.observe({"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "a", "content": "x"},
+        {"type": "tool_result", "tool_use_id": "b", "content": "out"},
+    ]}})
+    assert len(records) == 2
+    assert {r["tool"] for r in records} == {"Read", "Bash"}
+    assert {r["tool_call_id"] for r in records} == {"a", "b"}
+    assert tracker._open == {}   # neither call is left leaked open
 
 
 def test_tracker_handles_tool_result_content_as_a_block_list():
@@ -57,10 +82,10 @@ def test_tracker_handles_tool_result_content_as_a_block_list():
     tracker = ToolCallTracker()
     tracker.observe({"type": "assistant", "message": {"content": [
         {"type": "tool_use", "id": "a", "name": "Read", "input": {}}]}})
-    rec = tracker.observe({"type": "user", "message": {"content": [
+    records = tracker.observe({"type": "user", "message": {"content": [
         {"type": "tool_result", "tool_use_id": "a",
          "content": [{"type": "text", "text": "block form"}]}]}})
-    assert rec["result_snippet"] == "block form"
+    assert records[0]["result_snippet"] == "block form"
 
 
 def test_tracker_marks_an_errored_tool_result_not_ok():
@@ -68,10 +93,10 @@ def test_tracker_marks_an_errored_tool_result_not_ok():
     tracker = ToolCallTracker()
     tracker.observe({"type": "assistant", "message": {"content": [
         {"type": "tool_use", "id": "a", "name": "Bash", "input": {"command": "false"}}]}})
-    rec = tracker.observe({"type": "user", "message": {"content": [
+    records = tracker.observe({"type": "user", "message": {"content": [
         {"type": "tool_result", "tool_use_id": "a", "content": "boom",
          "is_error": True}]}})
-    assert rec["ok"] is False
+    assert records[0]["ok"] is False
 
 
 def test_tracker_tracks_context_occupancy_deduped_by_message_id():
