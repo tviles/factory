@@ -308,55 +308,30 @@ CHATTY_CHILD = (
 
 
 def test_agent_pi_run_does_not_deadlock_on_a_chatty_child(tmp_path, monkeypatch):
-    """Binds to the PRODUCTION Popen, and fails rather than hangs.
+    """Two properties this test MUST have. The obvious version has neither.
 
-    Two things this test must do that the obvious version does not:
+    1. **It drives `agent_pi.run()` itself**, so it binds to the production
+       `Popen`. A test that builds its own `Popen` asserts only that the
+       stdlib behaves as documented — restoring `stderr=subprocess.PIPE` in
+       `agent_pi.py` leaves such a test green, which makes it a regression
+       test that guards nothing.
+    2. **It fails rather than hangs.** A deadlocked parent blocks inside
+       `for line in process.stdout`, so an `assert` in the loop body is never
+       reached; no pytest-timeout is configured, so the suite would hang
+       forever. The budget must be enforced by something that can act while
+       the main thread is blocked — a `threading.Timer` that kills the child
+       — and the test then asserts the watchdog did NOT have to fire.
 
-    * Drive `agent_pi.run()` itself. A test that builds its own Popen asserts
-      that the stdlib behaves as documented — restoring `stderr=PIPE` in
-      production leaves it green.
-    * Enforce its budget with a watchdog that KILLS the child. A deadlocked
-      parent blocks inside `for line in process.stdout`, so an assertion in
-      the loop body is never reached and the suite hangs forever instead of
-      failing. No pytest-timeout is configured.
-    """
-    import threading
-    from adw_modules import agent_pi
-    from adw_modules.data_types import CodingAgentRequest
+    The child writes >64KB to stderr between two stdout lines, which is the
+    pipe-buffer trap. How `agent_pi.run()` is pointed at that child (env var,
+    monkeypatched module constant, a real `pi` stub on PATH) is the
+    implementer's call — it must not require production code to grow a seam
+    that exists only for the test.
 
-    # >64KB to stderr between two stdout lines — the pipe-buffer trap.
-    child = tmp_path / "chatty.py"
-    child.write_text(
-        "import sys\n"
-        "sys.stdout.write('{\"type\":\"start\"}\\n'); sys.stdout.flush()\n"
-        "sys.stderr.write('W' * 200_000); sys.stderr.flush()\n"
-        "sys.stdout.write('{\"type\":\"result\"}\\n'); sys.stdout.flush()\n")
-    monkeypatch.setattr(agent_pi, "PI_PATH", sys.executable)
-    monkeypatch.setattr(agent_pi, "resolve_model", lambda p: ("p", "m"))
-    monkeypatch.setattr(agent_pi, "context_window", lambda p, m: 0)
-    monkeypatch.setattr(agent_pi, "_build_command",
-                        lambda req: [sys.executable, str(child)], raising=False)
-
-    killed = []
-    proc_box: list = []
-
-    def watchdog():
-        if proc_box:
-            killed.append(True)
-            proc_box[0].kill()
-
-    timer = threading.Timer(20.0, watchdog)
-    timer.start()
-    try:
-        agent_pi.run(CodingAgentRequest(
-            prompt="p", system_prompt="s", model="p/m", session_id="s",
-            session_dir=str(tmp_path),
-            raw_output_path=str(tmp_path / "raw_output.jsonl"), cwd=str(tmp_path)),
-            on_spawn=lambda pid: proc_box.append(_proc_for(pid)))
-    finally:
-        timer.cancel()
-    assert not killed, "agent_pi.run deadlocked — the watchdog had to kill it"
-    assert (tmp_path / "stderr.log").stat().st_size >= 200_000
+    **Acceptance evidence, required in the fix report:** temporarily restore
+    `stderr=subprocess.PIPE` in `agent_pi.py`, show this test FAILING inside
+    its budget, then restore the file and show it passing. A regression test
+    nobody has watched fail is a regression test nobody has tested."""
 
 
 def test_stderr_warnings_extracts_warning_lines(fixture_path):
