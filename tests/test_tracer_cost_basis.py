@@ -112,6 +112,69 @@ def test_envelope_row_persists_all_fields(tmp_path):
                    '{"status": "success"}', 1, 1)
 
 
+def test_agent_session_row_persists_every_column(tmp_path):
+    """The move to AgentSessionRecord must not silently drop or default a
+    field an existing caller relies on — supplements the signature-only
+    check above with a real read-back of every non-timestamp column."""
+    from adw_modules.data_types import AgentSessionRecord
+    t = _tracer(tmp_path)
+    t.session_start("adw1", "eng")
+    agent = _agent(name="scout", coding_agent="claude_code")
+    agent.color = "#ff0000"
+    t.agent_session_row(AgentSessionRecord(
+        adw_id="adw1", agent=agent, session_id="sess-1", context_tokens=123,
+        context_window=200_000, cost_basis="list"))
+
+    row = t.conn.execute(
+        "SELECT adw_id, agent, coding_agent, model, color, session_id,"
+        " context_tokens, context_window, cost_basis"
+        " FROM agent_sessions WHERE adw_id='adw1' AND agent='scout'").fetchone()
+
+    assert row == ("adw1", "scout", "claude_code", "anthropic/claude-sonnet-5",
+                   "#ff0000", "sess-1", 123, 200_000, "list")
+
+
+def test_agent_session_row_upserts_on_conflict_instead_of_duplicating(tmp_path):
+    """agent_session_row's INSERT carries an ON CONFLICT(adw_id, agent) DO
+    UPDATE — a second call for the same (adw_id, agent) must update the
+    existing row's mutable columns in place, not raise or duplicate it.
+    created_at is untouched by the update clause (identity of the row), so it
+    must survive across the second call while last_used_at moves forward."""
+    import time
+
+    from adw_modules.data_types import AgentSessionRecord
+    t = _tracer(tmp_path)
+    t.session_start("adw1", "eng")
+    agent = _agent(name="scout", coding_agent="claude_code")
+
+    t.agent_session_row(AgentSessionRecord(
+        adw_id="adw1", agent=agent, session_id="sess-1", context_tokens=10,
+        context_window=100_000, cost_basis="billed"))
+    first_created_at = t.conn.execute(
+        "SELECT created_at FROM agent_sessions WHERE adw_id='adw1' AND agent='scout'"
+    ).fetchone()[0]
+
+    time.sleep(0.01)   # created_at/last_used_at are second-resolution ISO stamps
+    agent.model = "anthropic/claude-opus-5"
+    agent.color = "#00ff00"
+    t.agent_session_row(AgentSessionRecord(
+        adw_id="adw1", agent=agent, session_id="sess-2", context_tokens=999,
+        context_window=500_000, cost_basis="list"))
+
+    rows = t.conn.execute(
+        "SELECT model, color, session_id, context_tokens, context_window,"
+        " cost_basis, created_at, last_used_at"
+        " FROM agent_sessions WHERE adw_id='adw1' AND agent='scout'").fetchall()
+
+    assert len(rows) == 1   # upsert, not a second row
+    (model, color, session_id, context_tokens, context_window, cost_basis,
+     created_at, last_used_at) = rows[0]
+    assert (model, color, session_id, context_tokens, context_window, cost_basis) == (
+        "anthropic/claude-opus-5", "#00ff00", "sess-2", 999, 500_000, "list")
+    assert created_at == first_created_at   # row identity: untouched by the update
+    assert last_used_at != first_created_at   # but the update did land
+
+
 def test_migration_adds_the_column_to_an_older_db(tmp_path):
     """A db from an older SSSF must still open. CREATE TABLE IF NOT EXISTS
     never revisits an existing table, hence the explicit ALTER list."""

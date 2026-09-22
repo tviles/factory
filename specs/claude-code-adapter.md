@@ -156,10 +156,10 @@ Token accounting paths:
 - `tracer.agent_session_row(...)` upserts `agent_sessions` with
   `context_tokens` / `context_window`.
 
-`processes` table: `process_start(adw_id, kind, name, pid, command)` on spawn,
-`process_end(adw_id, pid)` on exit, `processes_end_all(adw_id)` from
-`session_finish`. `kind` is `'adw'` or `'agent'`; `command` is stored so a
-recycled pid is not killed by mistake.
+`processes` table: `process_start(ProcessRecord(adw_id, kind, name, pid,
+command))` on spawn, `process_end(adw_id, pid)` on exit,
+`processes_end_all(adw_id)` from `session_finish`. `kind` is `'adw'` or
+`'agent'`; `command` is stored so a recycled pid is not killed by mistake.
 
 ### 1.6 `agents.validate()` and the config schema
 

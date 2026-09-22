@@ -435,3 +435,44 @@ def test_execute_records_permission_denials_in_agent_end_payload(tmp_path, monke
     agent_end = next(c.args[0] for c in run.tracer.event.call_args_list
                      if c.args[0].type == "agent_end")
     assert agent_end.payload["permission_denials"] == denials
+
+
+def test_execute_records_the_spawned_process_via_on_spawn(tmp_path, monkeypatch):
+    """agents.py's _on_spawn (agents.py:264) constructs a real ProcessRecord
+    on every coding-agent spawn — post-review M4: neither the fake adapters
+    above nor the tracer suite's hand-written ProcessRecord exercise this
+    construction site, so a mistyped kwarg there would pass the whole suite.
+    None of the other dispatch tests' fake adapters call on_spawn/on_exit;
+    this one does, so the real call site in agents.py runs for real."""
+    from adw_modules import agents
+    from adw_modules.data_types import AgentCall, GenericOutput, ProcessRecord
+
+    cfg = _exec_cfg(tmp_path)
+    run = _fake_run(tmp_path, cfg)
+    phase = _phase("scout")
+    good = _result(text=json.dumps({"status": "success", "summary": "ok"}))
+
+    def _run_and_spawn(request, on_event=None, on_spawn=None, on_exit=None):
+        if on_spawn:
+            on_spawn(4242)
+        if on_exit:
+            on_exit(4242)
+        return good
+
+    fake_adapter = types.SimpleNamespace(
+        run=_run_and_spawn,
+        ToolCallTracker=lambda: types.SimpleNamespace(observe=lambda e: []))
+    monkeypatch.setitem(agents.ADAPTERS, "claude_code", fake_adapter)
+
+    agents.execute(run, phase, AgentCall(output_type=GenericOutput, prompt="go"))
+
+    (record,), _ = run.tracer.process_start.call_args
+    assert isinstance(record, ProcessRecord)
+    assert record.adw_id == "test-adw"
+    assert record.kind == "agent"
+    assert record.name == "scout"
+    assert record.pid == 4242
+    assert record.command == "claude_code scout anthropic/claude-sonnet-5"
+
+    run.tracer.process_end.assert_called_once_with("test-adw", 4242)
+    assert 4242 not in run.live_children   # on_exit discards what on_spawn added
