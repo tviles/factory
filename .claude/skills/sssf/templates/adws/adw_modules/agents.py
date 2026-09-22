@@ -21,8 +21,9 @@ from . import agent_cc, agent_pi, permissions, prompts
 from . import tracer as tracer_mod
 from .data_types import (AgentCall, AgentConfig, AgentSessionRecord,
                          CodingAgentRequest, CodingAgentResult, EnvelopeBase,
-                         EnvelopeRecord, EventRecord, GateCheck, GateReport,
-                         Phase, ProcessRecord, SSSFConfig, UsageBreakdown)
+                         EnvelopePersistence, EnvelopeRecord, EventRecord,
+                         GateCheck, GateReport, Phase, ProcessRecord,
+                         SSSFConfig, UsageBreakdown)
 from .utils import new_id
 
 JSON_FIX_ATTEMPTS = 2      # continue-with-correction attempts for malformed JSON
@@ -370,7 +371,9 @@ def execute(run, phase: Phase, call: AgentCall) -> EnvelopeBase:
                                      type="log", name="paths_touched",
                                      payload={"agent": agent.name, "paths": touched}))
 
-    _persist_envelope(run, phase, agent.name, call, envelope, attempt, valid=True)
+    _persist_envelope(run, EnvelopePersistence(
+        phase=phase, agent_name=agent.name, call=call, envelope=envelope,
+        attempt=attempt, valid=True))
     run.console.envelope_summary(envelope)
     context = latest or result
     run.tracer.agent_session_row(AgentSessionRecord(
@@ -463,14 +466,30 @@ def _extract_json(text: str) -> dict:
 
 def _parse_with_retries(run, phase: Phase, call: AgentCall, result, send):
     """Parse the final response against the declared output type; on failure,
-    continue the SAME session with a correction (bounded)."""
+    continue the SAME session with a correction (bounded).
+
+    Five params — over hard rule 4's four — but deliberately NOT bundled into
+    one object. The rule's own examples (AgentCall, PhaseParams) consolidate
+    several LOOSE SCALARS that travel together; every param here is already
+    one concrete, self-explanatory type (run, phase, call), plus the two
+    values that actually change each loop iteration: `result` is reassigned
+    on every retry and `send` is a callable, not data. `run`+`phase`+`call`
+    already have an established unbundled shape one function up — `execute(run,
+    phase, call)`, this module's own canonical 3-param call — so wrapping that
+    same trio in a new struct here just to also fit `result`/`send` inside
+    it would mean mutating a field of the passed object every iteration in
+    place of a local variable, and would contradict execute()'s own shape for
+    no reduction in real complexity. Left as five explicit params on purpose;
+    see the followups report for the fuller argument.
+    """
     for attempt in range(1, JSON_FIX_ATTEMPTS + 2):
         try:
             payload = _extract_json(result.text)
             return call.output_type.model_validate(payload), attempt
         except Exception as error:
-            _persist_envelope(run, phase, phase.params.owner, call, None, attempt,
-                              valid=False, raw=result.text)
+            _persist_envelope(run, EnvelopePersistence(
+                phase=phase, agent_name=phase.params.owner, call=call,
+                envelope=None, attempt=attempt, valid=False, raw=result.text))
             if attempt > JSON_FIX_ATTEMPTS:
                 raise RuntimeError(
                     f"{phase.params.owner} never produced valid "
@@ -484,15 +503,17 @@ def _parse_with_retries(run, phase: Phase, call: AgentCall, result, send):
                 f"fields: {fields}. No prose, no code fences.")
 
 
-def _persist_envelope(run, phase: Phase, agent_name: str, call: AgentCall,
-                      envelope: Optional[EnvelopeBase], attempt: int,
-                      valid: bool, raw: str = "") -> None:
+def _persist_envelope(run, params: EnvelopePersistence) -> None:
+    envelope, raw = params.envelope, params.raw
     payload_json = envelope.model_dump_json(indent=2) if envelope else json.dumps({"raw": raw[-2000:]})
     run.tracer.envelope_row(EnvelopeRecord(
-        phase=phase, agent=agent_name, output_type=call.output_type.__name__,
-        payload_json=payload_json, valid=valid, attempt=attempt))
+        phase=params.phase, agent=params.agent_name,
+        output_type=params.call.output_type.__name__,
+        payload_json=payload_json, valid=params.valid, attempt=params.attempt))
     if envelope:
-        record = {"agent_name": agent_name, "purpose": resolve(run.cfg, agent_name).purpose,
-                  "output_type": call.output_type.__name__, "attempt": attempt,
-                  **envelope.model_dump()}
-        (run.session_dir / agent_name / "envelope.json").write_text(json.dumps(record, indent=2))
+        record = {"agent_name": params.agent_name,
+                  "purpose": resolve(run.cfg, params.agent_name).purpose,
+                  "output_type": params.call.output_type.__name__,
+                  "attempt": params.attempt, **envelope.model_dump()}
+        (run.session_dir / params.agent_name / "envelope.json").write_text(
+            json.dumps(record, indent=2))

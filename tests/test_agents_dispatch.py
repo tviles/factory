@@ -475,4 +475,74 @@ def test_execute_records_the_spawned_process_via_on_spawn(tmp_path, monkeypatch)
     assert record.command == "claude_code scout anthropic/claude-sonnet-5"
 
     run.tracer.process_end.assert_called_once_with("test-adw", 4242)
+
+
+# ── hard rule 4: _persist_envelope's param count ─────────────────────────────
+#
+# dafa60b/ed85936 moved Tracer.agent_session_row, process_start, and
+# envelope_row onto one record each. _persist_envelope (agents.py) was the
+# same violation, deferred because it is private — eight loose params (run,
+# phase, agent_name, call, envelope, attempt, valid, raw). Fixed the same way:
+# one EnvelopePersistence object besides `run`, matching the pattern's own
+# ProcessRecord/AgentSessionRecord/EnvelopeRecord shape.
+
+def test_persist_envelope_takes_one_param_besides_run():
+    import inspect
+    from adw_modules import agents
+    params = list(inspect.signature(agents._persist_envelope).parameters)
+    assert params == ["run", "params"]
+
+
+def test_persist_envelope_writes_the_envelope_record_on_success(tmp_path, monkeypatch):
+    """The move to EnvelopePersistence must not silently drop or default a
+    field an existing caller relies on — mirrors
+    test_envelope_row_persists_all_fields's real-write shape, but through the
+    actual agents.py call site rather than constructing EnvelopeRecord by
+    hand."""
+    from adw_modules import agents
+    from adw_modules.data_types import AgentCall, EnvelopeRecord, GenericOutput
+
+    cfg = _exec_cfg(tmp_path)
+    run = _fake_run(tmp_path, cfg)
+    phase = _phase("scout")
+    good = _result(text=json.dumps({"status": "success", "summary": "ok"}))
+    fake_adapter, requests = _fake_adapter([good])
+    monkeypatch.setitem(agents.ADAPTERS, "claude_code", fake_adapter)
+
+    agents.execute(run, phase, AgentCall(output_type=GenericOutput, prompt="go"))
+
+    (record,), _ = run.tracer.envelope_row.call_args
+    assert isinstance(record, EnvelopeRecord)
+    assert record.agent == "scout"
+    assert record.output_type == "GenericOutput"
+    assert record.valid is True
+    assert json.loads(record.payload_json)["summary"] == "ok"
+
+    on_disk = json.loads((run.session_dir / "scout" / "envelope.json").read_text())
+    assert on_disk["agent_name"] == "scout"
+    assert on_disk["summary"] == "ok"
+
+
+def test_persist_envelope_writes_invalid_rows_from_the_retry_loop(tmp_path, monkeypatch):
+    """_parse_with_retries calls _persist_envelope on every failed parse
+    attempt too (EnvelopeRecord's own docstring) — the raw text must survive
+    the move into EnvelopePersistence's `raw` field."""
+    from adw_modules import agents
+    from adw_modules.data_types import AgentCall, GenericOutput
+
+    cfg = _exec_cfg(tmp_path)
+    run = _fake_run(tmp_path, cfg)
+    phase = _phase("scout")
+    bad = _result(text="not json at all")
+    good = _result(text=json.dumps({"status": "success", "summary": "ok"}))
+    fake_adapter, requests = _fake_adapter([bad, good])
+    monkeypatch.setitem(agents.ADAPTERS, "claude_code", fake_adapter)
+
+    agents.execute(run, phase, AgentCall(output_type=GenericOutput, prompt="go"))
+
+    invalid_calls = [c.args[0] for c in run.tracer.envelope_row.call_args_list
+                     if not c.args[0].valid]
+    assert len(invalid_calls) == 1
+    assert invalid_calls[0].attempt == 1
+    assert "not json at all" in invalid_calls[0].payload_json
     assert 4242 not in run.live_children   # on_exit discards what on_spawn added

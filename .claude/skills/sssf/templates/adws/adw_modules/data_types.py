@@ -440,6 +440,35 @@ class EnvelopeRecord(BaseModel):
     attempt: int
 
 
+class EnvelopePersistence(BaseModel):
+    """Everything agents._persist_envelope() needs besides `run`. One object,
+    never loose params.
+
+    _persist_envelope is what DERIVES an EnvelopeRecord's payload_json — the
+    envelope's own JSON on a successful parse, `{"raw": ...}` on a failed one
+    — and, on success, also writes agent_dir/envelope.json to disk. That is
+    strictly more than EnvelopeRecord itself carries (`call` down to its
+    output_type name, `envelope` before it is serialized, `raw` for the
+    failure branch), so it is its own type rather than a reuse of
+    EnvelopeRecord. Was eight loose params (run, phase, agent_name, call,
+    envelope, attempt, valid, raw) — the same hard-rule-4 violation
+    `dafa60b`/`ed85936` fixed for Tracer's own methods, left for a follow-up
+    because both call sites are inside agents.py, not Tracer, and the
+    function is private. `run` stays a separate top-level param rather than
+    folded in here: `execute(run, phase, call)`, three lines above the first
+    call site, is this file's own established shape for "the run context plus
+    what this call is about" — bundling `run` in here too would contradict it.
+    """
+
+    phase: Phase
+    agent_name: str
+    call: AgentCall
+    envelope: Optional[EnvelopeBase] = None
+    attempt: int
+    valid: bool
+    raw: str = ""
+
+
 # ── Pi coding agent interface ────────────────────────────────────────────────
 
 class CodingAgentRequest(BaseModel):
