@@ -117,6 +117,16 @@ def test_preflight_runs_once_even_with_several_claude_code_agents(tmp_path, monk
     assert len(calls) == 1, "one CLI call, not one per agent"
 
 
+def test_validate_caches_projects_directory_from_the_preflight(tmp_path, monkeypatch):
+    """review Important #6: validate() used to parse projectsDirectory out of
+    `claude auth status` and throw it away. It must now cache it so execute()
+    can record it without a second CLI call."""
+    from adw_modules import agent_cc, agents
+    monkeypatch.setattr(agent_cc, "_preflight_projects_directory", "")
+    agents.validate(_cfg(tmp_path), ["scout"])
+    assert agent_cc.projects_directory() == "/tmp/projects"   # from _no_real_preflight
+
+
 def test_pi_agents_still_validate_through_the_pi_resolver(tmp_path, monkeypatch):
     from adw_modules import agent_pi, agents
     seen = []
@@ -268,6 +278,62 @@ def test_execute_sets_restricted_only_for_a_read_only_agent(tmp_path, monkeypatc
         agents.execute(run, phase, AgentCall(output_type=GenericOutput, prompt="go"))
 
         assert requests[0].restricted is expected, f"writes={writes!r}"
+
+
+def test_execute_records_cc_session_uuid_and_projects_directory(tmp_path, monkeypatch):
+    """review Important #6: spec §1b's mitigation for the containment
+    regression (Claude Code transcripts live outside data_dir) was recording
+    projectsDirectory + the session uuid in agent_start and agent_map.json —
+    neither shipped. Pinned here for both destinations."""
+    from adw_modules import agent_cc, agents
+    from adw_modules.data_types import AgentCall, GenericOutput
+
+    monkeypatch.setattr(agent_cc, "_preflight_projects_directory",
+                        "/Users/x/.claude/projects")
+    cfg = _exec_cfg(tmp_path)
+    run = _fake_run(tmp_path, cfg)
+    phase = _phase("scout")
+    good = _result(text=json.dumps({"status": "success", "summary": "ok"}))
+    fake_adapter, requests = _fake_adapter([good])
+    monkeypatch.setitem(agents.ADAPTERS, "claude_code", fake_adapter)
+
+    agents.execute(run, phase, AgentCall(output_type=GenericOutput, prompt="go"))
+
+    started = next(c.args[0] for c in run.tracer.event.call_args_list
+                  if c.args[0].type == "agent_start")
+    expected_uuid = agent_cc.cc_session_uuid(requests[0].session_id)
+    assert started.payload["cc_session_uuid"] == expected_uuid
+    assert started.payload["cc_projects_directory"] == "/Users/x/.claude/projects"
+
+    entry = run.agent_map["scout"]
+    assert entry["cc_session_uuid"] == expected_uuid
+    assert entry["cc_projects_directory"] == "/Users/x/.claude/projects"
+
+
+def test_execute_leaves_cc_fields_empty_for_a_pi_agent(tmp_path, monkeypatch):
+    """The uuid/projectsDirectory mitigation is a claude_code-only concept —
+    a pi agent (whose sessions already live inside data_dir) must not get a
+    fabricated Claude Code uuid or a stale cached projects directory."""
+    from adw_modules import agent_cc, agents
+    from adw_modules.data_types import AgentCall, GenericOutput
+
+    monkeypatch.setattr(agent_cc, "_preflight_projects_directory",
+                        "/Users/x/.claude/projects")
+    cfg = _exec_cfg(tmp_path, coding_agent="pi", model="google/gemini-3.6-flash")
+    run = _fake_run(tmp_path, cfg)
+    phase = _phase("scout")
+    good = _result(text=json.dumps({"status": "success", "summary": "ok"}))
+    fake_adapter, requests = _fake_adapter([good])
+    monkeypatch.setitem(agents.ADAPTERS, "pi", fake_adapter)
+
+    agents.execute(run, phase, AgentCall(output_type=GenericOutput, prompt="go"))
+
+    started = next(c.args[0] for c in run.tracer.event.call_args_list
+                  if c.args[0].type == "agent_start")
+    assert started.payload["cc_session_uuid"] == ""
+    assert started.payload["cc_projects_directory"] == ""
+    assert run.agent_map["scout"]["cc_session_uuid"] == ""
+    assert run.agent_map["scout"]["cc_projects_directory"] == ""
 
 
 def test_execute_forwards_warnings_to_both_the_trace_and_the_console(tmp_path, monkeypatch):

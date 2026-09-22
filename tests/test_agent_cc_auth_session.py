@@ -99,3 +99,28 @@ def test_cc_session_uuid_is_deterministic():
 def test_cc_session_uuid_differs_per_agent():
     from adw_modules.agent_cc import cc_session_uuid
     assert cc_session_uuid("sssf-a1-planner-01") != cc_session_uuid("sssf-a1-builder-01")
+
+
+# ── projectsDirectory caching (review Important #6) ──────────────────────────
+
+def test_projects_directory_defaults_to_empty(monkeypatch):
+    from adw_modules import agent_cc
+    monkeypatch.setattr(agent_cc, "_preflight_projects_directory", "")
+    assert agent_cc.projects_directory() == ""
+
+
+def test_remember_projects_directory_caches_the_field(monkeypatch):
+    from adw_modules import agent_cc
+    monkeypatch.setattr(agent_cc, "_preflight_projects_directory", "")
+    agent_cc.remember_projects_directory(
+        {"loggedIn": True, "projectsDirectory": "/Users/x/.claude/projects"})
+    assert agent_cc.projects_directory() == "/Users/x/.claude/projects"
+
+
+def test_remember_projects_directory_tolerates_a_missing_field(monkeypatch):
+    """An inherit_api_key auth_status (WITH_API_KEY above) has no
+    projectsDirectory at all — must degrade to '', not raise."""
+    from adw_modules import agent_cc
+    monkeypatch.setattr(agent_cc, "_preflight_projects_directory", "stale")
+    agent_cc.remember_projects_directory({"loggedIn": True})
+    assert agent_cc.projects_directory() == ""

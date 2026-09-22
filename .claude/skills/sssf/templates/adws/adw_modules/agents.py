@@ -152,7 +152,13 @@ def validate(cfg: SSSFConfig, required: list[str]) -> None:
     # One CLI call for the whole roster, not one per agent.
     if needs_cc_preflight and not problems:
         try:
-            agent_cc.preflight_auth(cfg.defaults.claude_code.inherit_api_key)
+            auth_status = agent_cc.preflight_auth(cfg.defaults.claude_code.inherit_api_key)
+            # `projectsDirectory` used to be parsed here and thrown away.
+            # spec §1b's mitigation for the containment regression (Claude
+            # Code transcripts live outside data_dir) was recording where
+            # they went — cached here so execute() can put it in agent_start
+            # and agent_map.json without a second `claude auth status` call.
+            agent_cc.remember_projects_directory(auth_status)
         except ValueError as e:
             problems.append(str(e))
 
@@ -193,6 +199,13 @@ def execute(run, phase: Phase, call: AgentCall) -> EnvelopeBase:
 
     session_id, reused = _agent_session_id(run, agent)
     adapter = ADAPTERS[agent.coding_agent]
+    # spec §1b's mitigation for the containment regression (Claude Code
+    # transcripts live outside data_dir, unlike pi's, under
+    # <projectsDirectory>/<slug-of-cwd>/<uuid>.jsonl): record where they went.
+    # '' for a pi agent, or when validate() never ran a claude_code preflight.
+    is_claude_code = agent.coding_agent == "claude_code"
+    cc_uuid = agent_cc.cc_session_uuid(session_id) if is_claude_code else ""
+    cc_projects_dir = agent_cc.projects_directory() if is_claude_code else ""
     run.tracer.event(EventRecord(adw_id=run.adw_id, phase_id=phase.phase_id,
                                  type="agent_start", name=agent.name,
                                  payload={"model": agent.model, "thinking": agent.thinking,
@@ -201,7 +214,9 @@ def execute(run, phase: Phase, call: AgentCall) -> EnvelopeBase:
                                           "coding_agent": agent.coding_agent,
                                           "purpose": agent.purpose,
                                           "tools": agent.tools,  # None = all tools
-                                          "harness_engineering": agent.harness_engineering}))
+                                          "harness_engineering": agent.harness_engineering,
+                                          "cc_session_uuid": cc_uuid,
+                                          "cc_projects_directory": cc_projects_dir}))
     run.console.agent_started(agent.name, agent.model, session_id)
 
     # Parse retries and gate corrections re-enter the SAME session, so the
@@ -363,7 +378,9 @@ def execute(run, phase: Phase, call: AgentCall) -> EnvelopeBase:
                                  context_window=context.context_window,
                                  cost_basis=getattr(context, "cost_basis", "billed"))
     run.save_agent_map(agent.name, {"session_id": session_id, "model": agent.model,
-                                    "coding_agent": agent.coding_agent})
+                                    "coding_agent": agent.coding_agent,
+                                    "cc_session_uuid": cc_uuid,
+                                    "cc_projects_directory": cc_projects_dir})
     run.tracer.event(EventRecord(adw_id=run.adw_id, phase_id=phase.phase_id,
                                  type="handoff", name=agent.name,
                                  payload={"artifacts": envelope.artifacts,

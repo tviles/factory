@@ -127,15 +127,48 @@ def map_tools(tools: Optional[list[str]]) -> tuple[list[str], list[str]]:
 
 
 # Fixed namespace so an sssf session id always maps to the same Claude Code
-# uuid. Deterministic beats a stored uuid4: agent_map.json keeps its shape,
-# the mapping is reproducible from the trace when you need to `claude --resume`
-# a dead agent by hand, and an --adw-id rejoin needs no extra state.
+# uuid. Deterministic beats a stored uuid4: it is reproducible even if
+# agent_map.json is lost, and an --adw-id rejoin needs no extra state. Also
+# recorded directly in agent_start's payload and agent_map.json (spec §1b) —
+# the containment regression §1b accepts (transcripts live outside data_dir)
+# was explicitly traded for recording where they went, not for making the
+# operator re-derive this uuid by hand.
 CC_NAMESPACE = uuid.UUID("6f1f5b1e-3d0a-5e7c-9a2b-7c4d8e0f1a23")
 
 
 def cc_session_uuid(sssf_session_id: str) -> str:
     """sssf-<adw_id>-<agent>-<rand4> -> a stable uuid `--session-id` accepts."""
     return str(uuid.uuid5(CC_NAMESPACE, sssf_session_id))
+
+
+# `projectsDirectory` from the last `claude auth status` reading (see
+# preflight_auth/remember_projects_directory), so execute() can record where
+# THIS process's transcripts land without shelling out again — validate()
+# already runs the CLI once for the whole roster (spec §7a); this is what
+# lets every claude_code agent's agent_start payload and agent_map.json entry
+# know it too (spec §1b's mitigation for the containment regression).
+_preflight_projects_directory: str = ""
+
+
+def remember_projects_directory(auth_status: dict) -> None:
+    """Cache `projectsDirectory` out of a `claude auth status` reading.
+
+    Called from agents.validate() with whatever `preflight_auth()` (real or,
+    in a test, monkeypatched) returned — validate() previously parsed
+    `projectsDirectory` out of this dict and then threw it away.
+    """
+    global _preflight_projects_directory
+    _preflight_projects_directory = (auth_status or {}).get("projectsDirectory") or ""
+
+
+def projects_directory() -> str:
+    """The transcript root the last validate()-time preflight observed.
+
+    '' when no claude_code preflight has run yet in this process (a pi-only
+    chain, or a claude_code send issued before validate()) — callers must
+    treat that as "unknown", not fail.
+    """
+    return _preflight_projects_directory
 
 
 def parse_auth_status(raw: str, inherit_api_key: bool) -> dict:
