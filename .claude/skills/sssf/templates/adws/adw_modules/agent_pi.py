@@ -12,6 +12,7 @@ import json
 import os
 import subprocess
 import time
+import warnings
 from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Optional
@@ -100,6 +101,22 @@ def _context_tokens(usage: dict) -> int:
                    for part in ("input", "output", "cacheRead", "cacheWrite")))
 
 
+def _warn_if_models_path_was_explicit(detail: str) -> None:
+    """Stay quiet for the default MODELS_JSON — a fresh `pi` install has no
+    custom-models file, and that absence is normal, not an error. But an
+    operator who set PI_MODELS_PATH themselves and pointed it somewhere
+    broken made a mistake, not an absence, and silently falling back to only
+    the built-in catalog would hide it. `warnings.warn` rather than `print`:
+    this module has no `run`/console handle to log through, and modules here
+    never print.
+    """
+    if "PI_MODELS_PATH" in os.environ:
+        warnings.warn(
+            f"PI_MODELS_PATH={MODELS_JSON!r}: {detail}; falling back to "
+            "pi's built-in catalog only",
+            RuntimeWarning, stacklevel=3)
+
+
 def context_window(provider: str, model_id: str) -> int:
     """The model's context ceiling from pi's merged model catalog.
 
@@ -107,14 +124,30 @@ def context_window(provider: str, model_id: str) -> int:
     file, and `pi` itself works fine without one. Confirmed on a real box: a
     stamped scratch repo's pi run died here with FileNotFoundError before pi
     ever launched, on a machine where `pi --list-models` returns the built-in
-    catalog correctly. So a missing or malformed file is not an error here
-    either — it just means this run has no custom models, and the real
-    fallback (the `_pi_catalog()` scan below, which already knows the
-    built-ins) is what answers instead.
+    catalog correctly. So a missing file, a non-UTF-8 or malformed-JSON file,
+    or a file that parses to valid JSON that isn't an object (`null`, `[]`,
+    `"x"`) is not an error here either — it just means this run has no
+    (readable) custom models, and the real fallback (the `_pi_catalog()` scan
+    below, which already knows the built-ins) is what answers instead.
+
+    That silence is scoped to the DEFAULT path only. An operator who set
+    PI_MODELS_PATH explicitly and it turns out unreadable or malformed gets a
+    RuntimeWarning instead of a silent fallback — losing the default file is
+    normal, but losing a path someone deliberately configured is a mistake
+    they need to know about.
     """
+    registry: object = {}
     try:
         registry = json.loads(Path(MODELS_JSON).read_text())
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError) as exc:
+        # OSError: missing file, permission denied, etc. ValueError: covers
+        # both json.JSONDecodeError (malformed JSON) and UnicodeDecodeError
+        # (non-UTF-8 bytes) — both are ValueError subclasses, so this one
+        # except clause catches every "unreadable as JSON" shape.
+        _warn_if_models_path_was_explicit(f"could not be read as JSON ({exc})")
+        registry = {}
+    if not isinstance(registry, dict):
+        _warn_if_models_path_was_explicit("parsed but is not a JSON object")
         registry = {}
     for model in registry.get("providers", {}).get(provider, {}).get("models", []):
         if model.get("id") == model_id:
