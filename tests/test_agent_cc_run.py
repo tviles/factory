@@ -383,6 +383,75 @@ def test_run_raises_on_a_silent_hang(tmp_path, monkeypatch):
         f"run() took {elapsed:.1f}s to detect a silent hang with timeout_seconds=1"
 
 
+def test_overage_aborts_mid_stream_instead_of_waiting_out_the_send(tmp_path, monkeypatch):
+    """spec §8: OverageRefused must fire the MOMENT isUsingOverage: true is
+    observed, not after the whole send finishes. The child here emits a
+    rate_limit_event carrying isUsingOverage, then sleeps well past what any
+    of this test's assertions wait for — standing in for "several more turns
+    still to come". If the adapter only classified at end-of-send (the old
+    behaviour), it would have to wait out that sleep (or timeout_seconds)
+    before ever raising; the fix raises, and kills the child, immediately.
+
+    An outer safety net (same pattern as test_run_raises_on_a_silent_hang)
+    kills the child directly if the fix regresses, so a real regression fails
+    this test fast instead of hanging.
+    """
+    import os
+    import signal
+    import threading
+    import time as _time
+    from adw_modules import agent_cc
+
+    bindir = tmp_path / "fakebin"
+    bindir.mkdir(exist_ok=True)
+    script = bindir / "claude"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys, time\n"
+        "sys.stdout.write('{\"type\":\"system\",\"subtype\":\"init\","
+        "\"apiKeySource\":\"none\"}\\n')\n"
+        "sys.stdout.flush()\n"
+        "sys.stdout.write('{\"type\":\"rate_limit_event\",\"rate_limit_info\":"
+        "{\"status\":\"allowed\",\"isUsingOverage\":true,\"utilization\":1.0,"
+        "\"rateLimitType\":\"seven_day\"}}\\n')\n"
+        "sys.stdout.flush()\n"
+        "time.sleep(30)\n"                       # stands in for further turns
+        "sys.stdout.write('{\"type\":\"result\",\"subtype\":\"success\","
+        "\"is_error\":false,\"result\":\"done\"}\\n')\n"
+    )
+    script.chmod(0o755)
+    monkeypatch.setattr(agent_cc, "CLAUDE_PATH", str(script))
+
+    outer_timed_out = threading.Event()
+    watchdogs: list[threading.Timer] = []
+
+    def on_spawn(pid: int) -> None:
+        def _fire():
+            outer_timed_out.set()
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        timer = threading.Timer(10.0, _fire)
+        timer.daemon = True
+        timer.start()
+        watchdogs.append(timer)
+
+    started = _time.monotonic()
+    with pytest.raises(agent_cc.OverageRefused):
+        agent_cc.run(_req(tmp_path), on_spawn=on_spawn)
+    elapsed = _time.monotonic() - started
+
+    for timer in watchdogs:
+        timer.cancel()
+    assert not outer_timed_out.is_set(), \
+        "the outer safety net had to kill the child: OverageRefused did not fire mid-stream"
+    assert elapsed < 10, (
+        f"run() took {elapsed:.1f}s to refuse an observed overage — it must "
+        f"abort the moment rate_limit_event reports isUsingOverage, not wait "
+        f"out the child's remaining turns")
+
+
 def test_run_completes_with_a_spilled_prompt(tmp_path, fixture_path, monkeypatch):
     """Task 7 review Important #2: before the fix, nothing at the run() level
     exercised the spill path with a live child — only build_command's pure

@@ -262,16 +262,19 @@ def context_window_from_result(ev: dict, model: str) -> int:
     return int(entry.get("contextWindow") or 0)
 
 
-def classify(ev: dict, last_rate_limit: Optional[dict], on_overage: str) -> None:
-    """Raise if this `result` event is a failure re-prompting cannot fix.
+def _raise_if_overage(rl: dict, on_overage: str) -> None:
+    """The `OverageRefused` half of `classify()`, pulled out so the stream
+    loop in `_run_once` can call it too.
 
-    Ordered by specificity, and checked BEFORE the envelope text ever reaches
-    agents._extract_json. That ordering is the whole point: a rate-limit or
-    not-logged-in message is perfectly good TEXT, so left to fall through it
-    parses as "bad JSON", burns both correction sends against the same wall,
-    and kills the run reporting a prompt-engineering problem.
+    Spec §8: the adapter must raise the MOMENT it observes
+    `isUsingOverage: true`, not after the whole send finishes — a send that
+    flips into paid overage at turn 2 must not be left to run to completion
+    (up to `timeout_seconds`) before refusing. `_run_once` calls this right
+    where `rate_limit_event` is observed, which is the primary, EARLY check;
+    `classify()` below also calls it as a backstop for a result event whose
+    rate-limit info a future CLI surfaces some other way — by the time
+    `classify()` runs, this has almost always already fired from the loop.
     """
-    rl = last_rate_limit or {}
     # Fail CLOSED: `on_overage` is typed Literal["fail","warn"] upstream in
     # ClaudeCodeDefaults, but CodingAgentRequest.on_overage is a plain str, so
     # a direct construction bypasses that check. This guard's only job is
@@ -283,6 +286,19 @@ def classify(ev: dict, last_rate_limit: Optional[dict], on_overage: str) -> None
             f"(utilization={rl.get('utilization')}). Refusing to spend. Set "
             f"defaults.claude_code.on_overage: warn to allow it, or disable "
             f"extra usage in your Anthropic account settings.")
+
+
+def classify(ev: dict, last_rate_limit: Optional[dict], on_overage: str) -> None:
+    """Raise if this `result` event is a failure re-prompting cannot fix.
+
+    Ordered by specificity, and checked BEFORE the envelope text ever reaches
+    agents._extract_json. That ordering is the whole point: a rate-limit or
+    not-logged-in message is perfectly good TEXT, so left to fall through it
+    parses as "bad JSON", burns both correction sends against the same wall,
+    and kills the run reporting a prompt-engineering problem.
+    """
+    rl = last_rate_limit or {}
+    _raise_if_overage(rl, on_overage)
     if rl.get("status") in ("rejected", "blocked"):
         raise RateLimited(
             f"Claude Code rate limit reached: {rl.get('rateLimitType')} window "
@@ -595,6 +611,13 @@ def _run_once(request: CodingAgentRequest,
                     _assert_subscription_auth(event, request.inherit_api_key)
                 elif event.get("type") == "rate_limit_event":
                     last_rate_limit = event.get("rate_limit_info") or {}
+                    # The moment it is observed (spec §8), not end-of-send: a
+                    # send that flips into paid overage at turn 2 must not run
+                    # to completion first. Raising here lands inside this
+                    # try/except/finally, so it still goes through the same
+                    # kill_tree / process.wait() / on_exit path as any other
+                    # BaseException from this loop.
+                    _raise_if_overage(last_rate_limit, request.on_overage)
                 elif event.get("type") == "result":
                     result_event = event
                 tracker.observe(event)
