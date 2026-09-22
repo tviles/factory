@@ -84,6 +84,7 @@ CREATE TABLE IF NOT EXISTS agent_sessions (
   session_id    TEXT,
   context_tokens INTEGER,           -- window occupancy after the agent's last turn
   context_window INTEGER,           -- the model's ceiling; 0/NULL = unknown
+  cost_basis    TEXT DEFAULT 'billed',   -- 'billed' (real money) | 'list' (subscription notional)
   created_at    TEXT, last_used_at TEXT,
   PRIMARY KEY (adw_id, agent)
 );
@@ -96,7 +97,8 @@ MIGRATIONS = [("agent_sessions", "color", "TEXT"),
               ("sessions", "adw_name", "TEXT"),
               ("agent_sessions", "context_tokens", "INTEGER"),
               ("agent_sessions", "context_window", "INTEGER"),
-              ("sessions", "archived", "INTEGER DEFAULT 0")]
+              ("sessions", "archived", "INTEGER DEFAULT 0"),
+              ("agent_sessions", "cost_basis", "TEXT DEFAULT 'billed'")]
 
 
 class Tracer:
@@ -249,7 +251,8 @@ class Tracer:
         )
 
     def agent_session_row(self, adw_id: str, agent: AgentConfig, session_id: str,
-                          context_tokens: int = 0, context_window: int = 0) -> None:
+                          context_tokens: int = 0, context_window: int = 0,
+                          cost_basis: str = "billed") -> None:
         """The agent's config row is the source of truth for its label and color.
 
         Context is carried here rather than derived from events because the lane
@@ -259,13 +262,15 @@ class Tracer:
         ts = now_iso()
         self.conn.execute(
             "INSERT INTO agent_sessions (adw_id, agent, coding_agent, model, color,"
-            " session_id, context_tokens, context_window, created_at, last_used_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?)"
+            " session_id, context_tokens, context_window, cost_basis, created_at,"
+            " last_used_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?)"
             " ON CONFLICT(adw_id, agent) DO UPDATE SET model=excluded.model,"
             " color=excluded.color, session_id=excluded.session_id,"
             " context_tokens=excluded.context_tokens,"
             " context_window=excluded.context_window,"
+            " cost_basis=excluded.cost_basis,"
             " last_used_at=excluded.last_used_at",
             (adw_id, agent.name, agent.coding_agent, agent.model, agent.color,
-             session_id, context_tokens, context_window, ts, ts),
+             session_id, context_tokens, context_window, cost_basis, ts, ts),
         )

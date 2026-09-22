@@ -22,7 +22,7 @@ const ICONS = {
 // Every chip explains itself on hover. The token numbers in particular are read
 // wrong without one — the headline is billed volume, not distinct tokens.
 const TITLES = {
-  cost: 'Cost — dollars billed for this run, all agents combined.',
+  cost: 'Cost — dollars for this run, all agents combined. Subscription-billed agents report list price, not money charged.',
   tokens:
     'Tokens exchanged (billed) — everything sent or generated, counted once per turn. ' +
     'Each turn re-sends the whole conversation, so this is far larger than the ' +

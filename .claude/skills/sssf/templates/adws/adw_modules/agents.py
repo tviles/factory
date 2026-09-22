@@ -282,7 +282,8 @@ def execute(run, phase: Phase, call: AgentCall) -> EnvelopeBase:
     context = latest or result
     run.tracer.agent_session_row(run.adw_id, agent, session_id,
                                  context_tokens=context.context_tokens,
-                                 context_window=context.context_window)
+                                 context_window=context.context_window,
+                                 cost_basis=getattr(context, "cost_basis", "billed"))
     run.save_agent_map(agent.name, {"session_id": session_id, "model": agent.model,
                                     "coding_agent": agent.coding_agent})
     run.tracer.event(EventRecord(adw_id=run.adw_id, phase_id=phase.phase_id,
@@ -296,6 +297,8 @@ def execute(run, phase: Phase, call: AgentCall) -> EnvelopeBase:
                                  tokens=spent.total_tokens,
                                  payload={"cost": spent.total_cost,
                                           "usage": spent.model_dump(),
+                                          "cost_basis": getattr(context, "cost_basis", "billed"),
+                                          "rate_limit": getattr(context, "rate_limit", {}),
                                           "context_tokens": context.context_tokens,
                                           "context_window": context.context_window}))
     run.console.agent_finished(agent.name, spent.total_tokens, spent.total_cost)

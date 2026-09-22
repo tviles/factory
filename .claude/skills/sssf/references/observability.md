@@ -27,7 +27,12 @@ Location comes from `observability.db` in `sssf.config.yaml`, default `adws/adw_
 
 `parent_id` nests spans, so an agent phase expands into its tool-call spans in the UI.
 
-**Spend is itemised per phase.** `agent_end.usage` carries tokens *and* dollars for each component pi reports — `input`, `output`, `cache_read`, `cache_write` — summed across every send the phase made, so a phase that retried on a bad envelope or a failed gate shows what all its attempts cost, not just the last one. The four components sum to `total_tokens`, and their costs sum to `total_cost`; the visualizer's Cost panel renders them as a table you can add up by eye.
+**Spend is itemised per phase.** `agent_end.usage` carries tokens *and* dollars for each component pi reports — `input`, `output`, `cache_read`, `cache_write` — summed across every send the phase made, so a phase that retried on a bad envelope or a failed gate shows what all its attempts cost, not just the last one. The four components sum to `total_tokens` on every harness. **Their costs sum
+to `total_cost` only when `cost_basis` is `billed` (Pi).** A `claude_code`
+agent on a subscription reports `cost_basis: list`: the CLI gives one lump
+`total_cost_usd` at notional list price and no per-component split, so the
+component costs are unavailable rather than zero, and the UI says so instead of
+rendering `$0.0000` rows.
 
 `reasoning_tokens` is the thinking share and is **inside** `output_tokens`, not a fifth component — measured across every session on disk, reasoning never exceeds output and the four components always reconcile to the total. It bills at the output rate, so the panel nests it under output rather than adding it. Runs predating the breakdown have no `usage` key at all; the lump `cost` and the event's own `tokens` still stand, and the UI says so rather than rendering zeroes.
 

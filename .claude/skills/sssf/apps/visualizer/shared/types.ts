@@ -206,6 +206,13 @@ export interface AgentEndPayload {
   /** Window occupancy after the final turn, and the model's ceiling. */
   context_tokens?: number;
   context_window?: number;
+  /**
+   * "billed" (real money) vs "list" (a subscription harness's notional list
+   * price). Absent on runs predating the field, which the UI treats as billed.
+   */
+  cost_basis?: string;
+  /** The last rate_limit_event's `rate_limit_info`, verbatim. */
+  rate_limit?: Record<string, unknown>;
 }
 
 /**

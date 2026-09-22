@@ -68,11 +68,16 @@ const agentConfig = computed(() => {
 interface UsageRow {
   label: string
   tokens: number
-  cost: number
+  /** Undefined when the harness reports no per-component cost — rendered as an em dash. */
+  cost?: number
   /** Total gets a rule above it; reasoning is indented under output. */
   kind?: 'total' | 'nested'
   title?: string
 }
+
+const PRE_BREAKDOWN = 'this run predates the per-component breakdown — only the total was recorded'
+const NO_COMPONENT_COSTS =
+  'list price — this harness reports only a total, not per-component costs'
 
 /**
  * What this phase's agent run spent, off its `agent_end` event.
@@ -81,7 +86,7 @@ interface UsageRow {
  * recorded only a lump `cost`, so the breakdown is optional and rows are built
  * from whatever was written.
  */
-const phaseUsage = computed<{ rows: UsageRow[]; partial: boolean } | null>(() => {
+const phaseUsage = computed<{ rows: UsageRow[]; note: string } | null>(() => {
   if (props.phase.kind !== 'agent') return null
   const end = phaseEvents.value.find((e) => e.type === 'agent_end')
   if (!end) return null
@@ -95,13 +100,19 @@ const phaseUsage = computed<{ rows: UsageRow[]; partial: boolean } | null>(() =>
   if (!u) {
     // Pre-breakdown run: the event's own token count and the lump cost still hold.
     return {
-      partial: true,
+      note: PRE_BREAKDOWN,
       rows: [{ label: 'total', tokens: end.tokens ?? 0, cost: payload.cost ?? 0, kind: 'total' }],
     }
   }
+  // Claude Code on a subscription reports one lump total_cost_usd. The
+  // component costs are UNAVAILABLE, not zero — and money(0) renders '$0',
+  // which reads as "this was free". Tokens are real either way, so only the
+  // dollars drop out.
+  const listOnly = (payload.cost_basis ?? 'billed') === 'list'
+  const money_ = (n: number) => (listOnly ? undefined : n)
   const rows: UsageRow[] = [
-    { label: 'input', tokens: u.input_tokens, cost: u.input_cost },
-    { label: 'output', tokens: u.output_tokens, cost: u.output_cost },
+    { label: 'input', tokens: u.input_tokens, cost: money_(u.input_cost) },
+    { label: 'output', tokens: u.output_tokens, cost: money_(u.output_cost) },
   ]
   if (u.reasoning_tokens) {
     // Thinking bills at the output rate, so its share of the output cost is
@@ -110,17 +121,17 @@ const phaseUsage = computed<{ rows: UsageRow[]; partial: boolean } | null>(() =>
     rows.push({
       label: 'thinking',
       tokens: u.reasoning_tokens,
-      cost: share,
+      cost: money_(share),
       kind: 'nested',
       title: 'Thinking tokens — part of output above, billed at the output rate. Not added to the total.',
     })
   }
   rows.push(
-    { label: 'cache read', tokens: u.cache_read_tokens, cost: u.cache_read_cost },
-    { label: 'cache write', tokens: u.cache_write_tokens, cost: u.cache_write_cost },
+    { label: 'cache read', tokens: u.cache_read_tokens, cost: money_(u.cache_read_cost) },
+    { label: 'cache write', tokens: u.cache_write_tokens, cost: money_(u.cache_write_cost) },
     { label: 'total', tokens: u.total_tokens, cost: u.total_cost, kind: 'total' },
   )
-  return { rows, partial: false }
+  return { rows, note: listOnly ? NO_COMPONENT_COSTS : '' }
 })
 
 const NUM = new Intl.NumberFormat('en-US')
@@ -575,13 +586,11 @@ function togglePanel(id: string) {
               >
                 <td class="u-k">{{ r.label }}</td>
                 <td class="u-n">{{ NUM.format(r.tokens) }}</td>
-                <td class="u-c">{{ money(r.cost) }}</td>
+                <td class="u-c">{{ r.cost === undefined ? '—' : money(r.cost) }}</td>
               </tr>
             </tbody>
           </table>
-          <p v-if="phaseUsage.partial" class="faint u-note">
-            this run predates the per-component breakdown — only the total was recorded
-          </p>
+          <p v-if="phaseUsage.note" class="faint u-note">{{ phaseUsage.note }}</p>
         </DetailSection>
 
         <DetailSection
