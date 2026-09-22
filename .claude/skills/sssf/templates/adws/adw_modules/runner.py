@@ -56,6 +56,13 @@ class Run:
         self._agent_map_path = self.session_dir / "agent_map.json"
         self.agent_map: dict = (json.loads(self._agent_map_path.read_text())
                                 if self._agent_map_path.exists() else {})
+        # Children THIS process spawned and believes are alive. Deliberately
+        # in memory rather than read back from the processes table: the table
+        # also holds rows from older runs and from runs that crashed without
+        # closing them, and a recycled pid handed to os.killpg can take out an
+        # unrelated process GROUP. The question a signal handler must answer is
+        # not "what does the trace believe is running" but "what did I start".
+        self.live_children: set[int] = set()
 
     # ── agent map (adw_id -> per-agent coding-agent session ids) ────────────
     def save_agent_map(self, agent: str, entry: dict) -> None:

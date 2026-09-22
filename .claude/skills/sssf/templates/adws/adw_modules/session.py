@@ -15,7 +15,7 @@ from pathlib import Path
 from .data_types import SSSFConfig
 from .runner import Run
 from .tracer import Tracer
-from .utils import engineer_name, new_id
+from .utils import engineer_name, kill_tree, new_id
 
 
 def _finalize_when_killed(run: Run) -> None:
@@ -28,6 +28,12 @@ def _finalize_when_killed(run: Run) -> None:
     lets the phase context manager record the phase as failed on the way out.
     """
     def handler(signum, _frame):
+        # Reap before closing the trace. Closing the rows first would record
+        # the run as finished while its coding agent kept working — a killed
+        # ADW that leaves a `claude` or `pi` child running is exactly the pid
+        # nobody can find afterwards.
+        for pid in list(run.live_children):
+            kill_tree(pid)
         run.tracer.session_finish(run.adw_id, ok=False)   # also closes process rows
         raise SystemExit(128 + signum)
 

@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from .data_types import PiRequest, PiResult
-from .utils import now_iso, operator_env
+from .utils import now_iso, operator_env, stderr_warnings
 
 PI_PATH = os.environ.get("PI_PATH", "pi")
 MODELS_JSON = os.environ.get("PI_MODELS_PATH",
@@ -240,10 +240,18 @@ def run(request: PiRequest, on_event: Optional[Callable[[dict], None]] = None,
     # EOF. That failure is silent and total: no request goes out, no bytes come
     # back, and the ADW blocks on a read loop with nothing to read. Observed as
     # a run that sat idle at 0% CPU with an empty raw_output.jsonl.
-    process = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               text=True, bufsize=1, cwd=request.cwd,
-                               env=operator_env())
+    # stderr goes to a FILE, not a pipe. With both as pipes and a blocking
+    # stdout read, a child that fills the ~64KB stderr buffer blocks writing
+    # stderr, stops producing stdout, and both sides wait forever — the same
+    # silent 0%-CPU hang the stdin comment below describes, through the other
+    # pipe. A file has no fixed-size buffer, so it cannot happen.
+    stderr_path = raw_path.with_name("stderr.log")
+    stderr_path.parent.mkdir(parents=True, exist_ok=True)
+    with stderr_path.open("a") as err:
+        process = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.PIPE, stderr=err,
+                                   text=True, bufsize=1, cwd=request.cwd,
+                                   env=operator_env(), start_new_session=True)
     if on_spawn:
         on_spawn(process.pid)
     with raw_path.open("a") as raw:
@@ -277,8 +285,9 @@ def run(request: PiRequest, on_event: Optional[Callable[[dict], None]] = None,
             if on_event:
                 on_event(event)
 
-    stderr = process.stderr.read() if process.stderr else ""
     result.returncode = process.wait()
+    stderr = "\n".join(stderr_warnings(stderr_path)) or \
+        Path(stderr_path).read_text(errors="replace")[-800:]
     if on_exit:
         on_exit(process.pid)
     if result.returncode != 0 and not result.text:
