@@ -112,6 +112,13 @@ def claude_code_env(inherit_api_key: bool = False) -> dict[str, str]:
                 if k.startswith("CLAUDE_CODE_")
                 or k in ("CLAUDECODE", "CLAUDE_PID", "CLAUDE_TRANSCRIPT_PATH")]:
         env.pop(key, None)
+    # Set AFTER the blanket CLAUDE_CODE_* strip above, never before: an
+    # operator who exports this themselves to work around auto-memory would
+    # otherwise have it silently deleted by that same loop. `--setting-sources
+    # ""` and `--restricted` already close the CLAUDE.md-injection question
+    # (see agent_cc.build_command); this is unrelated — it is Claude Code's
+    # own agent-memory feature (spec §7b), which neither flag disables.
+    env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
     return env
 
 

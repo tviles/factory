@@ -332,3 +332,23 @@ def test_claude_code_env_can_inherit_the_key_when_asked(monkeypatch):
     assert env["ANTHROPIC_API_KEY"] == "sk-ant-kept"
     # nested-session contamination is stripped regardless — never configurable
     assert "CLAUDECODE" not in env
+
+
+def test_claude_code_env_sets_disable_auto_memory(monkeypatch):
+    """Spec §7b: the child env must always disable Claude Code's own
+    auto-memory loading, for every claude_code agent except the writes: []
+    ones --restricted already covers for free."""
+    from adw_modules.utils import claude_code_env
+    monkeypatch.delenv("CLAUDE_CODE_DISABLE_AUTO_MEMORY", raising=False)
+    env = claude_code_env()
+    assert env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1"
+
+
+def test_claude_code_env_disable_auto_memory_survives_an_operator_override(monkeypatch):
+    """The blanket CLAUDE_CODE_* strip (a few lines above the fix) would
+    otherwise delete an operator's own CLAUDE_CODE_DISABLE_AUTO_MEMORY before
+    the child ever saw it — the setter must run AFTER that strip."""
+    from adw_modules.utils import claude_code_env
+    monkeypatch.setenv("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "0")
+    env = claude_code_env()
+    assert env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1"
