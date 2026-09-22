@@ -1,5 +1,6 @@
 # sssf.config.yaml — the factory's agent roster. One agent, one prompt, one purpose.
-# v1 runs the Pi coding agent only; coding_agent: claude_code arrives in v2.
+# Two coding-agent interfaces: pi (default) and claude_code, which runs headless
+# Claude Code on your Claude subscription. See references/config.md.
 defaults:
   coding_agent: pi
   model: google/gemini-3.6-flash   # provider/id — a bare pattern is ambiguous across providers
@@ -31,6 +32,27 @@ defaults:
     - adws/adw_sssf_config/
     - adws/adw_*.py
   data_dir: adws/adw_data          # runtime home: {data_dir}/sessions/{adw_id}/{agent_name}/
+
+  # Only read when an agent sets coding_agent: claude_code.
+  claude_code:
+    # false strips ANTHROPIC_API_KEY (and ANTHROPIC_AUTH_TOKEN, ANTHROPIC_BASE_URL,
+    # the Bedrock/Vertex switches, CLAUDE_EFFORT) from the child's environment.
+    # THIS is what keeps a run on your Max subscription: with the key present,
+    # Claude Code reports apiKeySource: ANTHROPIC_API_KEY and bills the API.
+    # agents.validate() refuses to start unless `claude auth status` agrees.
+    inherit_api_key: false
+    timeout_seconds: 1800        # wall clock per send; 0 disables
+    # A subscription past its limits falls through to PAID overage. `fail`
+    # aborts the moment that is seen. The authoritative control is account-side:
+    # disable extra usage in your Anthropic settings.
+    on_overage: fail             # fail | warn
+    # Refuse to START a chain when a LIVE rate-limit window was last seen at or
+    # above this. 1.0 refuses only a window read as fully exhausted. This cannot
+    # false-alarm: a recorded utilisation only rises until its resetsAt, so an
+    # expired window is ignored on fact and a live one can only understate.
+    # It is a pre-filter, not a guarantee — it knows nothing about a fresh repo,
+    # or about `claude` you ran interactively outside the factory.
+    max_utilization: 1.0
 
 observability:
   db: adws/adw_data/sssf.db        # tracer writes here directly; the UI polls it
@@ -141,3 +163,31 @@ agents:
       - bash
       - write
       - edit
+
+  # ── Running an agent on Claude Code instead of Pi ──────────────────────────
+  # Uncomment to move the reviewer onto your Claude subscription. Note what
+  # CHANGES versus a pi agent, all of it enforced by agents.validate():
+  #   * model MUST be anthropic/<id> — any other provider fails at startup
+  #   * harness_engineering MUST be empty — Pi .ts extensions cannot load;
+  #     Claude Code's built-in Task tool replaces subagents.ts
+  #   * tool names map read->Read, bash->Bash, edit->Edit, write->Write,
+  #     grep->Grep, find->Glob. `ls` has no equivalent and is dropped.
+  #     Omitting `tools` gives the same six, NOT all 28 Claude Code tools.
+  #   * thinking off/minimal clamp to low (Claude Code's ladder starts at low)
+  #
+  # - name: reviewer_cc
+  #   coding_agent: claude_code
+  #   model: anthropic/claude-sonnet-5
+  #   thinking: high
+  #   color: "#fb7185"
+  #   purpose: Confirm that what was built is what was asked for; change nothing.
+  #   prompt_engineering:
+  #     system: adws/adw_data/prompt_engineering/reviewer/system.md
+  #     user: adws/adw_data/prompt_engineering/reviewer/user.md
+  #   writes: []                 # also adds --restricted to the child
+  #   tools:
+  #     - read
+  #     - grep
+  #     - find
+  #     - bash
+  #     - write

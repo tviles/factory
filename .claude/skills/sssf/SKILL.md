@@ -71,6 +71,15 @@ Deep specs, when needed: [references/config.md](references/config.md) · [refere
 9. **`tools:` is a capability list, `writes:` is the boundary** — `bash` runs anything (including `git checkout`) and `write` reaches any path, so a tool list can never make "this agent changes nothing" true. `writes:` per agent and `protected_files` in defaults are enforced in `adw_modules/permissions.py` after every agent call: unauthorized changes are rolled back and the phase dies. The session runtime under `data_dir` is always writable — a read-only agent is read-only with respect to the REPO, never mute.
 10. **Every ADW ends in `run.finish()`** — phases passing is not the same as the run being accepted. A test phase that ran a red suite succeeded at its job. Pass `accepted=` so the exit code, the session status, and the banner are decided together and cannot disagree.
 
-## v1 scope
+## Coding agents
 
-Pi coding agent only (`coding_agent: pi`), default model `gemini-3.6-flash` via openrouter, thinking `medium`. `claude_code` is schema-valid but stubbed until v2. The visualizer app ships in a later pass — observe via sqlite queries until then.
+Two interfaces. `coding_agent: pi` (default) runs the Pi coding agent against
+whatever provider its model names. `coding_agent: claude_code` runs headless
+Claude Code on your Claude subscription — the model must be `anthropic/<id>`,
+`harness_engineering` must be empty, and `agents.validate()` verifies with
+`claude auth status` that the run will bill the subscription rather than the
+API before any phase opens. See [references/config.md](references/config.md).
+
+The default roster still runs `coding_agent: pi`, default model
+`gemini-3.6-flash` via openrouter, thinking `medium`. The visualizer app ships
+in a later pass — observe via sqlite queries until then.
