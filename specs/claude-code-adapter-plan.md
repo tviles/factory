@@ -3462,12 +3462,46 @@ Implements: spec §9 tests 4–19. **This is the only task that spends subscript
 > throughout, and stop at the first red. `just` is NOT installed — use the
 > `uv run` forms below.
 
-- [ ] **Step 1: Check headroom before spending anything**
+- [ ] **Step 1: Measure headroom before spending anything**
+
+`claude auth status` proves *which credential*; it does **not** report
+utilisation — no rate-limit field appears in its output. The only source of
+utilisation is a `rate_limit_event` on a real run's stream, so measuring
+headroom costs exactly one cheap call. Spend it:
 
 ```bash
-claude auth status
+claude auth status                                    # credential: loggedIn + authMethod
+claude -p "ok" --output-format stream-json --verbose \
+  --model claude-haiku-4-5-20251001 \
+  --session-id "$(uuidgen | tr 'A-Z' 'a-z')" \
+  --tools "" --setting-sources "" --strict-mcp-config < /dev/null \
+| python3 -c "
+import json,sys,datetime
+for l in sys.stdin:
+    l=l.strip()
+    if not l: continue
+    try: e=json.loads(l)
+    except: continue
+    if e.get('type')=='rate_limit_event':
+        r=e['rate_limit_info']
+        print('overage:', r.get('isUsingOverage'))
+        for name,w in (r.get('unifiedWindows') or {}).items():
+            print(f'{name}: {w[\"utilization\"]:.3f} resets '
+                  f'{datetime.datetime.fromtimestamp(w[\"resetsAt\"]).isoformat()}')
+"
 ```
-Expected: `loggedIn: true`, `authMethod: "claude.ai"`, a non-null `subscriptionType`. If utilisation is known to be near 1.0, **stop and wait for the window to reset** — a red run here is indistinguishable from a bug.
+
+**Gate on the result, do not just read it.** This matrix is roughly 30 model
+calls including multi-agent chains with retries.
+
+| seven_day utilisation | do |
+|---|---|
+| < 0.70 | run the full matrix |
+| 0.70 – 0.90 | run steps 4–8 only (validation, first run, key-strip, isolation, mixed chain + correction loop); defer kill/timeout/overage |
+| > 0.90 | **stop and wait for the reset.** A red run here is indistinguishable from a bug, and if the account has extra usage enabled, crossing 1.0 starts billing real money — the outcome this whole feature exists to avoid |
+
+Record the measured numbers in `tests/live/README.md` before proceeding, so a
+later reader knows what headroom the results were obtained under.
 
 - [ ] **Step 2: Stamp a scratch repo**
 
