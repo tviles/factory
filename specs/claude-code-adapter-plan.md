@@ -1985,6 +1985,25 @@ def test_run_surfaces_stderr_warnings(tmp_path, fake_claude, monkeypatch):
     assert any("Unknown --effort value" in w for w in result.warnings)
 
 
+def test_run_scans_only_this_attempts_stderr_on_retry(tmp_path, fake_claude, monkeypatch):
+    """send() is called repeatedly against ONE append-mode log, so attempt 2
+    must not report attempt 1's warnings. Same defect Task 2 fixed in
+    agent_pi.py — pinned here so the new adapter cannot reintroduce it."""
+    from adw_modules import agent_cc
+    first = fake_claude(tmp_path / "a", "tool_use_roundtrip.jsonl",
+                        stderr_text="Warning: FIRST attempt only\n")
+    second = fake_claude(tmp_path / "b", "tool_use_roundtrip.jsonl",
+                         stderr_text="Warning: SECOND attempt\n")
+    req = _req(tmp_path)
+    monkeypatch.setattr(agent_cc, "CLAUDE_PATH", str(first / "claude"))
+    agent_cc.run(req)
+    monkeypatch.setattr(agent_cc, "CLAUDE_PATH", str(second / "claude"))
+    result = agent_cc.run(req)
+    joined = " ".join(result.warnings)
+    assert "SECOND attempt" in joined
+    assert "FIRST attempt" not in joined, "leaked a previous attempt's stderr"
+
+
 def test_run_raises_on_a_nonzero_exit_with_no_text(tmp_path, fake_claude, monkeypatch):
     from adw_modules import agent_cc
     bindir = fake_claude(tmp_path, "empty.jsonl", exit_code=1,
@@ -2097,6 +2116,13 @@ def run(request: CodingAgentRequest,
     raw_path.parent.mkdir(parents=True, exist_ok=True)
     stderr_path = Path(request.stderr_path or raw_path.with_name("stderr.log"))
     stderr_path.parent.mkdir(parents=True, exist_ok=True)
+    # One log per agent-phase, appended to — but this send reads only ITS OWN
+    # bytes. `send()` is called repeatedly for one agent by design (JSON
+    # retries, gate corrections; see agents.py:105), so scanning the whole file
+    # would report a previous attempt's warnings and could show a previous
+    # attempt's crash tail. Same defect Task 2 fixed in agent_pi.py; do not
+    # reintroduce it here.
+    stderr_offset = stderr_path.stat().st_size if stderr_path.exists() else 0
 
     result = CodingAgentResult(session_id=request.session_id, cost_basis="list")
     tracker = ToolCallTracker()
@@ -2163,10 +2189,10 @@ def run(request: CodingAgentRequest,
         if on_exit:
             on_exit(process.pid)
 
-    result.warnings = warnings + stderr_warnings(stderr_path)
+    result.warnings = warnings + stderr_warnings(stderr_path, offset=stderr_offset)
 
     if result_event is None:
-        tail = stderr_path.read_text(errors="replace").strip()[-800:]
+        tail = stderr_path.read_bytes()[stderr_offset:][-800:].decode(errors="replace").strip()
         raise CodingAgentError(
             f"claude exited {result.returncode} without a result event: {tail}")
 

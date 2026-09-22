@@ -180,3 +180,32 @@ def stderr_warnings(path: str | Path, limit: int = 20, offset: int = 0) -> list[
     hits = [ln.strip() for ln in text.splitlines()
             if ln.strip().startswith(("Warning:", "Error:", "warning:", "error:"))]
     return hits[:limit]
+
+
+RESULT_SNIPPET_CHARS = 20_000   # tool output rides along whole; clip only guards pathological cases
+ARG_VALUE_CHARS = 20_000        # args too — the UI scrolls, it must not be handed cut-off data
+LABEL_CHARS = 80                # "bash: <command>" shown as the event name
+
+# The arg that identifies a call at a glance, in the order tools tend to use.
+# Covers both harnesses: Pi's `command`/`path`, Claude Code's `file_path`,
+# `pattern` (Grep), `query` (WebSearch), `url` (WebFetch).
+PRIMARY_ARGS = ("command", "path", "file_path", "pattern", "query", "url")
+
+
+def clip(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit].rstrip() + "…"
+
+
+def tool_label(tool: str, args: dict) -> str:
+    """One-line human name for a tool call: `Bash: ls -la src`.
+
+    Shared by both adapters on purpose. The label is the event NAME in the
+    trace, so two harnesses computing it differently would make the same tool
+    call look like two different things in the UI.
+    """
+    value = next((args[key] for key in PRIMARY_ARGS
+                  if isinstance(args.get(key), str) and args[key].strip()), "")
+    if not value:
+        value = next((v for v in args.values() if isinstance(v, str) and v.strip()), "")
+    value = " ".join(str(value).split())
+    return f"{tool}: {clip(value, LABEL_CHARS)}" if value else tool
