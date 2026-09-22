@@ -3,17 +3,28 @@ in the tracer/console plumbing that is supposed to just be recording it.
 
 0db53dd wired Tracer.close() into session_finish() as "the one chokepoint
 every run-ending path funnels through" — but session_finish() is not the end
-of a run on the phase-failure path: runner.py's `except BaseException` branch
-calls it and then keeps writing (console.phase_ended, console.session_finished,
-both of which trace through Console._emit -> tracer.event). Once session_finish
-has closed the connection, every one of those later writes hits a `None` conn
-and raises AttributeError, burying the original error (e.g. a real provider
-429) under an unrelated crash.
+of a run on EITHER path that matters: runner.py's `except BaseException`
+branch (phase failure) and Run.finish (the ordinary SUCCESS path) both call
+it and then keep writing (console.phase_ended, console.session_finished,
+both of which trace through Console._emit -> tracer.event). Once
+session_finish has closed the connection, every one of those later writes
+hits a `None` conn and raises AttributeError.
 
-This test drives a phase to failure through the real `Run.phase` context
-manager with a LIVE Tracer (no mocks) — exactly the path nothing in the
-existing 187-test suite exercised end-to-end — and asserts the run reports
-the original exception, not an AttributeError from a closed connection.
+This is worse than "a failed phase crashes": a real run of a trivial,
+fully-successful ADW script crashed with exit code 1 even though the db row
+said "success" and the terminal banner printed "✓ success" — because
+Console._emit PRINTS first, then traces, so the banner renders fine and the
+process dies immediately after. Run.finish's own docstring exists precisely
+to keep the db status, the terminal banner, and the exit code from
+disagreeing (after an earlier bug where a run was recorded green while
+exiting 1) — this regression recreated exactly that failure shape from the
+other direction. So every test below that exercises a successful run asserts
+the actual exit code Run.finish returns, not just the absence of a
+traceback.
+
+These tests drive a phase to failure AND to success through the real
+`Run.phase`/`Run.finish` path with a LIVE Tracer (no mocks) — exactly the
+path nothing in the existing 187-test suite exercised end-to-end.
 """
 
 from __future__ import annotations
@@ -95,18 +106,40 @@ def test_a_failing_phase_persists_the_error_to_sqlite_before_closing(tmp_path):
         reader.close()
 
 
-def test_run_finish_still_closes_the_tracer_on_the_normal_success_path(tmp_path):
-    """Path 1 (Run.finish): the success tail must also still close — the fix
-    must not simply delete the close, only relocate it past the writes that
-    need a live connection."""
+def test_run_finish_returns_exit_code_0_and_closes_on_a_real_successful_run(tmp_path):
+    """Path 1 (Run.finish): the escalated finding — a fully-successful run
+    crashed with exit code 1 pre-fix, because console.session_finished
+    traces AFTER session_finish had already closed the connection. Assert
+    the actual return value `sys.exit(main())` would receive, not just the
+    absence of a traceback: a green run must exit 0, matching its own db
+    status and terminal banner (the exact agreement Run.finish's docstring
+    promises). Also confirms the fix didn't just delete the close — it still
+    releases the connection once this path's writes are done."""
     from adw_modules.data_types import PhaseParams
 
     run, tracer = _run(tmp_path)
     with run.phase(PhaseParams(name="build", kind="code", owner="tester",
                                description="test phase")):
         pass
-    run.finish()
+    exit_code = run.finish()
 
+    assert exit_code == 0
+    assert tracer.conn is None
+
+
+def test_run_finish_returns_exit_code_1_and_still_closes_when_not_accepted(tmp_path):
+    """The phases-passed-but-not-accepted case (e.g. a builder whose tests
+    never went green) must keep disagreeing correctly — exit 1 — and must
+    still close cleanly, not just the all-phases-succeeded case above."""
+    from adw_modules.data_types import PhaseParams
+
+    run, tracer = _run(tmp_path)
+    with run.phase(PhaseParams(name="build", kind="code", owner="tester",
+                               description="test phase")):
+        pass
+    exit_code = run.finish(accepted=False, reason="acceptance test never passed")
+
+    assert exit_code == 1
     assert tracer.conn is None
 
 
