@@ -152,6 +152,75 @@ def test_run_scans_only_this_attempts_stderr_on_retry(tmp_path, monkeypatch):
         "a retry must not surface a PREVIOUS attempt's stderr as its own cause"
 
 
+def test_run_kills_and_reaps_the_child_when_on_event_raises(tmp_path, monkeypatch):
+    """Regression for the merge-blocking Pi orphan: `agent_pi.py:249` gained
+    `start_new_session=True` (needed so `kill_tree` can reach the child via its
+    own process group) but the read loop had no `try/finally` guard around it —
+    unlike `agent_cc._run_once`, which has exactly this guard at
+    `agent_cc.py:603-610`. A realistic fault (a locked-sqlite write inside
+    `tracer.event()`, called from `on_event`) then unwinds `run()` leaving the
+    `pi` child alive and DETACHED — Ctrl-C on the ADW no longer reaches it,
+    `on_exit` never fires so the pid is stuck in `run.live_children` forever,
+    and `process.wait()` is never called so it is never reaped.
+
+    This test must fail against unfixed `agent_pi.py` (the child survives and
+    on_exit never fires) and pass once `run()` gets the same
+    `except BaseException: kill_tree(...); raise` / `finally: wait(); on_exit()`
+    shape `agent_cc._run_once` already has.
+    """
+    import os
+    from adw_modules import agent_pi
+
+    # Emits one real event (so `on_event` has something to fire on), then
+    # sleeps well past this test's assertions — long enough that, if the
+    # child is NOT killed, it is still observably alive when we check.
+    fake_pi = _fake_pi_script(tmp_path, (
+        "import sys, time\n"
+        "sys.stdout.write('{\"type\":\"message_end\",\"message\":"
+        "{\"role\":\"assistant\",\"content\":[],\"usage\":{}}}\\n')\n"
+        "sys.stdout.flush()\n"
+        "time.sleep(60)\n"
+    ))
+    _patch_pi_resolution(monkeypatch, agent_pi, fake_pi)
+    request = _pi_request(tmp_path)
+
+    spawned: list[int] = []
+    exited: list[int] = []
+
+    def _boom(event: dict) -> None:
+        raise RuntimeError("simulated tracer/sqlite failure inside on_event")
+
+    try:
+        with pytest.raises(RuntimeError, match="simulated tracer/sqlite failure"):
+            agent_pi.run(request, on_event=_boom,
+                        on_spawn=spawned.append, on_exit=exited.append)
+
+        assert spawned, "the child must have been spawned before the raise"
+        pid = spawned[0]
+
+        still_alive = True
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            still_alive = False
+
+        assert not still_alive, (
+            "the pi child must not survive on_event raising — it must be "
+            "killed the same way agent_cc._run_once kills its child on any "
+            "BaseException from the read loop")
+        assert exited == [pid], (
+            "on_exit must fire so run.live_children/the processes row can "
+            "close — otherwise the pid is stuck 'alive' in the trace forever")
+    finally:
+        # Best-effort cleanup so a failing (pre-fix) run of this test does not
+        # leak a detached sleeping process into the rest of the suite.
+        if spawned:
+            try:
+                os.kill(spawned[0], 9)
+            except ProcessLookupError:
+                pass
+
+
 def test_stderr_warnings_extracts_warning_lines(fixture_path):
     from adw_modules.utils import stderr_warnings
     lines = stderr_warnings(fixture_path("effort_off.err"))

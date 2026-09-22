@@ -1,4 +1,4 @@
-"""Pi coding agent interface — v1's only coding agent.
+"""Pi coding agent interface.
 
 Runs `pi -p --mode json` and tails its JSONL stdout line by line, forwarding
 each event to a callback WHILE the agent works (the streaming crack, solved
@@ -18,8 +18,8 @@ from typing import Callable, Optional
 
 from .data_types import PiRequest, PiResult
 from .utils import (ARG_VALUE_CHARS, LABEL_CHARS, PRIMARY_ARGS,
-                    RESULT_SNIPPET_CHARS, clip as _clip, now_iso, operator_env,
-                    stderr_warnings, tool_label as _label)
+                    RESULT_SNIPPET_CHARS, clip as _clip, kill_tree, now_iso,
+                    operator_env, stderr_warnings, tool_label as _label)
 
 PI_PATH = os.environ.get("PI_PATH", "pi")
 MODELS_JSON = os.environ.get("PI_MODELS_PATH",
@@ -249,38 +249,56 @@ def run(request: PiRequest, on_event: Optional[Callable[[dict], None]] = None,
                                    env=operator_env(), start_new_session=True)
     if on_spawn:
         on_spawn(process.pid)
-    with raw_path.open("a") as raw:
-        assert process.stdout is not None
-        for line in process.stdout:
-            raw.write(line)
-            raw.flush()                      # events land on disk as they happen
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if event.get("type") == "message_end":
-                message = event.get("message", {})
-                if message.get("role") == "assistant":
-                    text = _text_of(message)
-                    if text:
-                        result.text = text   # last assistant message wins
-                    usage = message.get("usage", {}) or {}
-                    turn = _context_tokens(usage)
-                    result.tokens += turn
-                    result.usage.add_turn(usage, turn)
-                    # Occupancy is read off the last VALID assistant turn, the
-                    # way pi does it — an aborted or errored turn reports usage
-                    # you can't trust, so it must not overwrite a good reading.
-                    if turn and message.get("stopReason") not in ("aborted", "error"):
-                        result.context_tokens = turn
-                    result.cost += (usage.get("cost", {}) or {}).get("total", 0.0) or 0.0
-            if on_event:
-                on_event(event)
+    # `start_new_session=True` (above) takes pi out of this ADW's own process
+    # group so `kill_tree` can reach it as a group leader — but that same
+    # detachment means the terminal's Ctrl-C no longer reaches it directly,
+    # and nothing else was left to clean it up. Mirrors agent_cc._run_once's
+    # guard (agent_cc.py:603-610): any exception unwinding this loop — most
+    # realistically a locked-sqlite write inside tracer.event(), called from
+    # on_event — must still kill the child and let on_exit fire, or the pid
+    # is stuck "alive" in run.live_children forever with nothing able to stop
+    # it.
+    try:
+        with raw_path.open("a") as raw:
+            assert process.stdout is not None
+            for line in process.stdout:
+                raw.write(line)
+                raw.flush()                      # events land on disk as they happen
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("type") == "message_end":
+                    message = event.get("message", {})
+                    if message.get("role") == "assistant":
+                        text = _text_of(message)
+                        if text:
+                            result.text = text   # last assistant message wins
+                        usage = message.get("usage", {}) or {}
+                        turn = _context_tokens(usage)
+                        result.tokens += turn
+                        result.usage.add_turn(usage, turn)
+                        # Occupancy is read off the last VALID assistant turn, the
+                        # way pi does it — an aborted or errored turn reports usage
+                        # you can't trust, so it must not overwrite a good reading.
+                        if turn and message.get("stopReason") not in ("aborted", "error"):
+                            result.context_tokens = turn
+                        result.cost += (usage.get("cost", {}) or {}).get("total", 0.0) or 0.0
+                if on_event:
+                    on_event(event)
+    except BaseException:
+        kill_tree(process.pid)
+        raise
+    finally:
+        if process.poll() is None:
+            kill_tree(process.pid)
+        result.returncode = process.wait()
+        if on_exit:
+            on_exit(process.pid)
 
-    result.returncode = process.wait()
     # Both, never `or`: the docstring's own motivating example — a benign
     # `Warning: Unknown --effort value 'off'` — exits 0 and would, under `or`,
     # suppress the tail entirely. A log holding that warning AND a fatal
@@ -288,8 +306,6 @@ def run(request: PiRequest, on_event: Optional[Callable[[dict], None]] = None,
     # would then report only the harmless line, discarding the real cause.
     tail = stderr_path.read_bytes()[stderr_offset:][-800:].decode(errors="replace")
     stderr = "\n".join(stderr_warnings(stderr_path, offset=stderr_offset) + [tail])
-    if on_exit:
-        on_exit(process.pid)
     if result.returncode != 0 and not result.text:
         raise RuntimeError(f"pi exited {result.returncode}: {stderr.strip()[-800:]}")
     return result
