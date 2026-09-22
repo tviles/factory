@@ -204,11 +204,21 @@ def execute(run, phase: Phase, call: AgentCall) -> EnvelopeBase:
             on_spawn=_on_spawn,
             on_exit=_on_exit)
         resumed = True                      # every later send continues
-        for warning in getattr(result, "warnings", []):
+        # `warnings` is a declared field with a default_factory on the shared
+        # CodingAgentResult both adapters return — not `getattr(..., [])`,
+        # which would silently swallow every warning from a future adapter
+        # that forgot the field instead of raising loudly.
+        for warning in result.warnings:
+            # Both the structured event (for the visualizer) and the console
+            # line (for an operator watching a live run): Tasks 5-6 added
+            # these warnings — the --effort clamp, the missing-init-event
+            # notice — specifically so a human would see them, and a
+            # tracer-only event leaves them visible nowhere but sqlite.
             run.tracer.event(EventRecord(adw_id=run.adw_id, phase_id=phase.phase_id,
                                          type="log", name="coding_agent_warning",
                                          payload={"agent": agent.name,
                                                   "message": warning}))
+            run.console.note(f"{agent.name}: {warning}")
         run.add_usage(result.tokens, result.cost)
         spent.merge(result.usage)
         latest = result
