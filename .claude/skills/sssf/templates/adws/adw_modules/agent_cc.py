@@ -123,3 +123,70 @@ def map_tools(tools: Optional[list[str]]) -> tuple[list[str], list[str]]:
     if not mapped:
         raise ValueError("no usable tools after mapping — the agent will stall")
     return mapped, warnings
+
+
+# Fixed namespace so an sssf session id always maps to the same Claude Code
+# uuid. Deterministic beats a stored uuid4: agent_map.json keeps its shape,
+# the mapping is reproducible from the trace when you need to `claude --resume`
+# a dead agent by hand, and an --adw-id rejoin needs no extra state.
+CC_NAMESPACE = uuid.UUID("6f1f5b1e-3d0a-5e7c-9a2b-7c4d8e0f1a23")
+
+
+def cc_session_uuid(sssf_session_id: str) -> str:
+    """sssf-<adw_id>-<agent>-<rand4> -> a stable uuid `--session-id` accepts."""
+    return str(uuid.uuid5(CC_NAMESPACE, sssf_session_id))
+
+
+def parse_auth_status(raw: str, inherit_api_key: bool) -> dict:
+    """Validate `claude auth status` output. Raises ValueError with the fix.
+
+    Checking `init.apiKeySource == "none"` alone is NOT enough: "none" means
+    "no API key in use", and an unauthenticated session reports it too. This
+    is the positive check — that a usable credential exists AND that it is the
+    subscription rather than an API key.
+    """
+    try:
+        info = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"could not parse `claude auth status` output: {error}"
+                         f"\n{raw[:400]}") from error
+    if not info.get("loggedIn"):
+        raise ValueError("Claude Code is not logged in — run `claude auth login`. "
+                         "(`claude auth status` reports loggedIn: false)")
+    if not inherit_api_key:
+        if info.get("apiKeySource"):
+            raise ValueError(
+                f"Claude Code would bill the API, not your subscription: "
+                f"apiKeySource={info['apiKeySource']!r}. Unset it, or set "
+                f"defaults.claude_code.inherit_api_key: true to allow it.")
+        if info.get("authMethod") != "claude.ai":
+            raise ValueError(
+                f"expected subscription auth (authMethod 'claude.ai'), got "
+                f"{info.get('authMethod')!r}. Set "
+                f"defaults.claude_code.inherit_api_key: true to allow it.")
+    # subscriptionType is RECORDED, never gated on — it is an Anthropic-
+    # controlled plan name, and requiring a value would fail a Pro seat, a
+    # Team/Enterprise seat, or any future rename.
+    return info
+
+
+def preflight_auth(inherit_api_key: bool = False) -> dict:
+    """Run `claude auth status` under the stripped child env. No model call.
+
+    Belongs in validate(): hard rule 1 says nothing spawns against a
+    half-valid config, and an unauthenticated CLI is exactly that.
+    """
+    try:
+        result = subprocess.run(
+            [CLAUDE_PATH, "auth", "status"], capture_output=True, text=True,
+            timeout=30, stdin=subprocess.DEVNULL,
+            env=claude_code_env(inherit_api_key), check=False)
+    except FileNotFoundError as error:
+        raise ValueError(f"the `claude` CLI was not found on PATH "
+                         f"(CLAUDE_PATH={CLAUDE_PATH!r})") from error
+    except subprocess.TimeoutExpired as error:
+        raise ValueError("`claude auth status` timed out after 30s") from error
+    if result.returncode != 0:
+        raise ValueError(f"`claude auth status` exited {result.returncode}: "
+                         f"{result.stderr.strip()[:400]}")
+    return parse_auth_status(result.stdout, inherit_api_key)
