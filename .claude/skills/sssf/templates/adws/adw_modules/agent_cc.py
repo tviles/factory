@@ -679,6 +679,35 @@ def _run_once(request: CodingAgentRequest,
         if process.poll() is None:
             kill_tree(process.pid)
         result.returncode = process.wait()
+        # process.stdout is the read end of the PIPE opened above. Popen never
+        # closes it for us, and nothing else in this function does either —
+        # confirmed by `-W error::ResourceWarning` reporting an unclosed-pipe
+        # warning per call before this line existed. Same reasoning as
+        # agent_pi.run()'s matching close: send() re-enters for one
+        # agent-phase (parse-fix and gate-correction retries), so a chain of
+        # sends in one ADW process accumulates leaked fds instead of each
+        # being reclaimed by GC soon after. Closed HERE, after wait() so the
+        # child is already reaped, and guarded so a redundant/already-closed
+        # pipe cannot itself raise and mask the real exception this `finally`
+        # may be unwinding.
+        try:
+            if process.stdout is not None:
+                process.stdout.close()
+        except OSError:
+            pass
+        # The spill path (above) opens stdin as a SECOND pipe and closes it
+        # itself right after the write — but only on the write's happy path.
+        # A BrokenPipeError there is caught and re-raised as CodingAgentError
+        # BEFORE that close() runs, so that write end leaked too: verified by
+        # `-W error::ResourceWarning` still reporting one unclosed pipe on
+        # test_run_still_fires_on_exit_when_the_spill_write_breaks_the_pipe
+        # even after the stdout close above was added. Same guard, same
+        # reasoning — idempotent against the already-closed happy-path case.
+        try:
+            if process.stdin is not None:
+                process.stdin.close()
+        except OSError:
+            pass
         if on_exit:
             on_exit(process.pid)
 

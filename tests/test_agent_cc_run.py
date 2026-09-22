@@ -517,6 +517,12 @@ def test_run_still_fires_on_exit_when_the_spill_write_breaks_the_pipe(
 
     def _popen(*args, **kwargs):
         process = real_popen(*args, **kwargs)
+        # real_popen already opened a real stdin pipe; swapping it for the
+        # stub below drops the only reference to that real pipe object
+        # without ever closing it — a test-only leak (agent_cc.py never gets
+        # a handle to it to close), caught by
+        # `-W error::ResourceWarning` reporting it as unclosed.
+        process.stdin.close()
         process.stdin = _BrokenStdin()
         return process
 

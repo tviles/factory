@@ -342,6 +342,22 @@ def run(request: PiRequest, on_event: Optional[Callable[[dict], None]] = None,
         if process.poll() is None:
             kill_tree(process.pid)
         result.returncode = process.wait()
+        # process.stdout is the read end of the PIPE opened above. Popen never
+        # closes it for us, and it is never closed anywhere else in this
+        # function either — confirmed by `-W error::ResourceWarning` reporting
+        # an unclosed-pipe warning per call before this line existed. A single
+        # send() leaking one fd is invisible; agents.py calls send() repeatedly
+        # for one agent-phase (the first prompt, then JSON-correction and gate
+        # retries — see agents.py's `latest`/`spent` comment), so a long chain
+        # in one ADW process accumulates them instead of each being reclaimed
+        # by GC soon after. Closed HERE, after wait() so the child is already
+        # reaped, and guarded so a redundant/already-closed pipe cannot itself
+        # raise and mask the real exception this `finally` may be unwinding.
+        try:
+            if process.stdout is not None:
+                process.stdout.close()
+        except OSError:
+            pass
         if on_exit:
             on_exit(process.pid)
 
