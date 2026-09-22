@@ -209,32 +209,32 @@ class Tracer:
                           (request[:500], adw_id))
 
     def session_finish(self, adw_id: str, ok: bool) -> None:
+        """Write the session's final status. Does NOT close the connection.
+
+        session_finish is called from three places, and on two of them it is
+        NOT the last write of the run: Run.finish and Run.phase's except
+        branch (runner.py) both call it and then keep going — phase_ended /
+        session_finished on Console, which traces through Console._emit ->
+        tracer.event. A close() here would hand those later writes a dead
+        connection (`AttributeError: 'NoneType' object has no attribute
+        'execute'`), burying whatever real error the run was reporting.
+        Closing is the caller's job, done once every write for that path is
+        actually finished — see Run.finish and Run.phase in runner.py.
+
+        The guard below still matters even without a close() in this method:
+        session._finalize_when_killed's SIGTERM/SIGINT handler calls this
+        unconditionally and cannot know whether the run already finished
+        normally (and its runner.py tail already closed the connection) —
+        that race must stay a safe no-op, not a crash inside a signal
+        handler.
+        """
         if self.conn is None:
-            # A run finishes exactly once in practice, but this guards the
-            # one realistic double-call: session._finalize_when_killed's
-            # SIGTERM/SIGINT handler can preempt the main thread at any
-            # instruction boundary, including right after Run.finish's own
-            # session_finish already closed the connection. Without this, that
-            # race is a crash (`AttributeError: 'NoneType' has no attribute
-            # 'execute'`) in a signal handler — exactly the kind of dead-
-            # connection write this method must never produce.
             return
         self.conn.execute(
             "UPDATE sessions SET status=?, ended_at=? WHERE adw_id=?",
             ("success" if ok else "fail", now_iso(), adw_id),
         )
         self.processes_end_all(adw_id)   # nothing of this run is alive any more
-        # session_finish is the last write on every path that ends a run: the
-        # normal one (Run.finish), the phase-raised one (Run.phase's except
-        # branch, runner.py), and session._finalize_when_killed's SIGTERM/
-        # SIGINT handler, which calls this and then raises SystemExit. None of
-        # those three call sites touch self.conn again afterward — verified by
-        # reading every caller, not assumed — so closing HERE, at the one
-        # chokepoint all three already funnel through, cannot leave a later
-        # write hitting a dead connection. The visualizer polls sssf.db from
-        # its OWN connection in WAL mode (see last_rate_limit's read-only
-        # connect above); closing the writer's handle here does not touch it.
-        self.close()
 
     def close(self) -> None:
         """Release the sqlite connection this Tracer owns.
@@ -243,9 +243,21 @@ class Tracer:
         Tracer built in the test suite before this existed — one connection
         per Tracer (unlike the per-SEND pipe leak agent_pi.py/agent_cc.py fix,
         this is per-run, so it is far less severe, but it is still a resource
-        this object owns and never released). Idempotent: a second call (the
-        signal handler racing an already-finished run, or a defensive future
-        caller) must not raise.
+        this object owns and never released). Idempotent: a second call (a
+        defensive future caller, or racing paths that both reach a close())
+        must not raise.
+
+        Called explicitly by runner.py's Run.finish and by Run.phase's except
+        branch, each AFTER their last console/tracer write for that path —
+        never from session_finish itself (see its docstring). The signal
+        handler in session.py deliberately does NOT call this: it cannot tell
+        whether Run.phase's except branch still needs the connection for the
+        writes that follow session_finish on that path, so closing there
+        would reintroduce the exact bug this split fixes. When a kill signal
+        lands outside any phase and outside Run.finish, the connection is
+        simply left for the process teardown to reclaim — a rare, inert
+        trade against the alternative of a live connection being closed out
+        from under a write in progress.
         """
         if self.conn is not None:
             self.conn.close()

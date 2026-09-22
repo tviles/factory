@@ -34,7 +34,18 @@ def _finalize_when_killed(run: Run) -> None:
         # nobody can find afterwards.
         for pid in list(run.live_children):
             kill_tree(pid)
-        run.tracer.session_finish(run.adw_id, ok=False)   # also closes process rows
+        # Writes the session/process rows only — deliberately does NOT close
+        # the tracer's connection. This handler can preempt the main thread
+        # mid-phase, in which case the SystemExit raised below is caught by
+        # Run.phase's `except BaseException` branch (runner.py), which still
+        # needs a live connection to record the failure and trace the
+        # console output that follows. Closing here would hand that branch a
+        # dead connection — the exact bug this split exists to avoid. Each
+        # runner.py tail (Run.finish, Run.phase's except branch) closes the
+        # connection itself once ITS writes are done; if neither runs after
+        # this handler (e.g. the signal lands between phases), the
+        # connection is simply left for process teardown to reclaim.
+        run.tracer.session_finish(run.adw_id, ok=False)   # also ends process rows
         raise SystemExit(128 + signum)
 
     for sig in (signal.SIGTERM, signal.SIGINT):

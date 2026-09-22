@@ -107,6 +107,13 @@ class Run:
             self.console.phase_ended(phase, time.monotonic() - clock)
             self.console.session_finished(False, self.tokens, self.cost,
                                           self.cfg.observability.db)
+            # The ADW script's main() never reaches Run.finish() on this
+            # path (the raise below propagates straight out of every
+            # adw_*.py — phases are never nested), so this IS the run's true
+            # end: every trace/console write above is done. Close here, not
+            # inside session_finish, which is not the last write on this
+            # path (see Tracer.session_finish's docstring).
+            self.tracer.close()
             raise
         else:
             phase.status = "success"
@@ -146,4 +153,9 @@ class Run:
             self.console.note(f"not accepted: {note}")
         self.tracer.session_finish(self.adw_id, ok=ok)
         self.console.session_finished(ok, self.tokens, self.cost, self.cfg.observability.db)
+        # This is the run's true end on the success path: nothing in
+        # adw_modules writes to the tracer again after this. Close here, not
+        # inside session_finish (see its docstring) — session_finished above
+        # still needs a live connection to trace itself.
+        self.tracer.close()
         return 0 if ok else 1
