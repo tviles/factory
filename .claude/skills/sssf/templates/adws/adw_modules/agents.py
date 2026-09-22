@@ -10,12 +10,15 @@ disposes.
 from __future__ import annotations
 
 import json
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 import yaml
 
 from . import agent_cc, agent_pi, permissions, prompts
+from . import tracer as tracer_mod
 from .data_types import (AgentCall, AgentConfig, CodingAgentRequest,
                          CodingAgentResult, EnvelopeBase, EventRecord,
                          GateCheck, GateReport, Phase, SSSFConfig,
@@ -32,6 +35,36 @@ ADAPTERS = {"pi": agent_pi, "claude_code": agent_cc}
 
 class GateFailure(RuntimeError):
     pass
+
+
+def _now() -> float:
+    """Seeded in tests; a module-level seam beats monkeypatching time."""
+    return time.time()
+
+
+def exhausted_windows(rate_limit: dict, max_utilization: float,
+                      now: Optional[float] = None) -> list[tuple[str, float, int]]:
+    """Live windows at or above the bar, as (name, utilization, resets_at).
+
+    A recorded utilisation only rises until its resetsAt, so an unexpired
+    reading is a LOWER bound on the current one and an expired one is simply
+    void. That is why this cannot raise a false alarm.
+    """
+    now = _now() if now is None else now
+    windows = rate_limit.get("unifiedWindows") or {}
+    if not windows and rate_limit.get("resetsAt"):
+        windows = {rate_limit.get("rateLimitType", "window"): {
+            "utilization": rate_limit.get("utilization", 0.0),
+            "resetsAt": rate_limit["resetsAt"]}}
+    hits = []
+    for name, window in windows.items():
+        resets_at = window.get("resetsAt") or 0
+        if now >= resets_at:
+            continue                                # window reset; reading void
+        utilization = window.get("utilization") or 0.0
+        if utilization >= max_utilization:
+            hits.append((name, utilization, resets_at))
+    return hits
 
 
 # ── config ───────────────────────────────────────────────────────────────────
@@ -112,6 +145,19 @@ def validate(cfg: SSSFConfig, required: list[str]) -> None:
             agent_cc.preflight_auth(cfg.defaults.claude_code.inherit_api_key)
         except ValueError as e:
             problems.append(str(e))
+
+        # A recorded utilisation is a lower bound until its resetsAt passes —
+        # see exhausted_windows' docstring — so this can only under-react,
+        # never refuse a chain that could actually finish.
+        rate_limit = tracer_mod.last_rate_limit(cfg.observability.db)
+        bar = cfg.defaults.claude_code.max_utilization
+        for name, utilization, resets_at in exhausted_windows(rate_limit or {}, bar):
+            when = datetime.fromtimestamp(resets_at, timezone.utc).isoformat()
+            problems.append(
+                f"Claude Code subscription: the {name} window was last observed "
+                f"at utilization={utilization:.2f} (limit {bar:.2f}) and does not "
+                f"reset until {when}. Refusing to start a chain that cannot "
+                f"finish. Raise defaults.claude_code.max_utilization to override.")
 
     if problems:
         raise SystemExit("config validation failed:\n- " + "\n- ".join(problems))

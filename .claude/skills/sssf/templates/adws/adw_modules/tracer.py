@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
+from typing import Optional
 
 from .data_types import AgentConfig, EventRecord, GateReport, Phase
 from .utils import ensure_dir, new_id, now_iso
@@ -99,6 +100,38 @@ MIGRATIONS = [("agent_sessions", "color", "TEXT"),
               ("agent_sessions", "context_window", "INTEGER"),
               ("sessions", "archived", "INTEGER DEFAULT 0"),
               ("agent_sessions", "cost_basis", "TEXT DEFAULT 'billed'")]
+
+
+def last_rate_limit(db_path: str | Path) -> Optional[dict]:
+    """The most recent rate_limit_info any claude_code agent recorded.
+
+    A plain function opening a READ-ONLY connection, so validate() can consult
+    the trace without constructing a Tracer — which would create the db file
+    and run migrations as a side effect of a check that is supposed to be
+    inert. Returns None when there is no db yet, or no claude_code history:
+    the first run of a fresh repo simply has nothing to go on.
+    """
+    if not Path(db_path).exists():
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return None
+    try:
+        for (payload,) in conn.execute(
+                "SELECT payload_json FROM events WHERE type='agent_end' "
+                "ORDER BY rowid DESC LIMIT 25"):
+            try:
+                rate_limit = (json.loads(payload or "{}") or {}).get("rate_limit")
+            except json.JSONDecodeError:
+                continue
+            if rate_limit:
+                return rate_limit
+        return None
+    except sqlite3.Error:
+        return None            # an older db without the column is not an error
+    finally:
+        conn.close()
 
 
 class Tracer:
