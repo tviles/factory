@@ -293,3 +293,26 @@ def test_execute_forwards_warnings_to_both_the_trace_and_the_console(tmp_path, m
     assert len(traced) == 1
     assert traced[0].payload == {"agent": "scout", "message": warning}
     run.console.note.assert_called_once_with(f"scout: {warning}")
+
+
+def test_execute_records_permission_denials_in_agent_end_payload(tmp_path, monkeypatch):
+    """spec §7c: --permission-prompts none silently denies anything that
+    would have prompted; result.permission_denials must reach the agent_end
+    payload so a mysteriously-stalled agent is diagnosable from the trace."""
+    from adw_modules import agents
+    from adw_modules.data_types import AgentCall, CodingAgentResult, GenericOutput
+
+    cfg = _exec_cfg(tmp_path)
+    run = _fake_run(tmp_path, cfg)
+    phase = _phase("scout")
+    denials = [{"tool_name": "Bash", "tool_input": {"command": "rm -rf /"}}]
+    result = CodingAgentResult(text=json.dumps({"status": "success", "summary": "ok"}),
+                               permission_denials=denials)
+    fake_adapter, requests = _fake_adapter([result])
+    monkeypatch.setitem(agents.ADAPTERS, "claude_code", fake_adapter)
+
+    agents.execute(run, phase, AgentCall(output_type=GenericOutput, prompt="go"))
+
+    agent_end = next(c.args[0] for c in run.tracer.event.call_args_list
+                     if c.args[0].type == "agent_end")
+    assert agent_end.payload["permission_denials"] == denials

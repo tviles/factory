@@ -650,6 +650,17 @@ def _run_once(request: CodingAgentRequest,
     result.context_window = context_window_from_result(result_event, model)
     if last_rate_limit:
         result.rate_limit = last_rate_limit
+    # `--permission-prompts none` (build_command) converts every would-be
+    # prompt into a SILENT automatic denial — this is the only record of what
+    # got refused. Surfaced as a warning too (not just the payload field) so
+    # an operator watching a live run sees it the same way they see an
+    # --effort clamp, rather than just debugging their prompt (spec §7c).
+    result.permission_denials = result_event.get("permission_denials") or []
+    if result.permission_denials:
+        result.warnings.append(
+            f"claude denied {len(result.permission_denials)} permission "
+            f"prompt(s) under --permission-prompts none: "
+            f"{result.permission_denials}")
     if result.returncode != 0 and not result.text:
         # Same tail as the "no result event" raise above (review Minor #4):
         # without it the retry wrapper cannot match a session signature on

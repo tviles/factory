@@ -355,6 +355,7 @@ def execute(run, phase: Phase, call: AgentCall) -> EnvelopeBase:
                                           "usage": spent.model_dump(),
                                           "cost_basis": getattr(context, "cost_basis", "billed"),
                                           "rate_limit": getattr(context, "rate_limit", {}),
+                                          "permission_denials": getattr(context, "permission_denials", []),
                                           "context_tokens": context.context_tokens,
                                           "context_window": context.context_window}))
     run.console.agent_finished(agent.name, spent.total_tokens, spent.total_cost)

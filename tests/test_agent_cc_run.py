@@ -197,6 +197,44 @@ def test_run_refuses_when_the_child_reports_api_key_billing(tmp_path, fixture_pa
     assert "ANTHROPIC_API_KEY" in str(e.value)
 
 
+def test_run_records_permission_denials_and_warns_when_present(
+        tmp_path, fixture_path, monkeypatch):
+    """spec §7c: `--permission-prompts none` silently denies anything that
+    would have prompted, so `result.permission_denials` is the only audit
+    trail. It must land on the result AND as a warning an operator sees on a
+    live run, not just a field nothing reads."""
+    import json
+    from adw_modules import agent_cc
+    events = [json.loads(l) for l in fixture_path("tool_use_roundtrip.jsonl")
+              .read_text().splitlines() if l.strip()]
+    for e in events:
+        if e.get("type") == "result":
+            e["permission_denials"] = [{"tool_name": "Bash",
+                                        "tool_input": {"command": "rm -rf /"}}]
+    doctored = tmp_path / "denied.jsonl"
+    doctored.write_text("\n".join(json.dumps(e) for e in events) + "\n")
+    bindir = tmp_path / "fakebin"; bindir.mkdir(exist_ok=True)
+    script = bindir / "claude"
+    script.write_text("#!/usr/bin/env python3\nimport sys,pathlib\n"
+                      f"sys.stdout.write(pathlib.Path({str(doctored)!r}).read_text())\n")
+    script.chmod(0o755)
+    monkeypatch.setattr(agent_cc, "CLAUDE_PATH", str(script))
+
+    result = agent_cc.run(_req(tmp_path))
+
+    assert result.permission_denials == [
+        {"tool_name": "Bash", "tool_input": {"command": "rm -rf /"}}]
+    assert any("permission" in w.lower() and "Bash" in w for w in result.warnings)
+
+
+def test_run_permission_denials_defaults_to_empty(tmp_path, fake_claude, monkeypatch):
+    from adw_modules import agent_cc
+    bindir = fake_claude(tmp_path, "tool_use_roundtrip.jsonl")
+    monkeypatch.setattr(agent_cc, "CLAUDE_PATH", str(bindir / "claude"))
+    result = agent_cc.run(_req(tmp_path))
+    assert result.permission_denials == []
+
+
 def test_run_scans_only_this_attempts_stderr_on_retry(tmp_path, fake_claude, monkeypatch):
     """send() is called repeatedly against ONE append-mode log, so attempt 2
     must not report attempt 1's warnings. Same defect Task 2 fixed in

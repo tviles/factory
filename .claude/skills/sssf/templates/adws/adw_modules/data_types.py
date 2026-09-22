@@ -501,6 +501,11 @@ class CodingAgentResult(BaseModel):
     # (`Warning: Unknown --effort value …`) while exiting 0, so without this
     # the trace is blind to them.
     warnings: list[str] = Field(default_factory=list)
+    # Claude Code's `result.permission_denials`, verbatim. The adapter runs
+    # with `--permission-prompts none`, which turns every would-be prompt into
+    # a SILENT automatic denial — this is the only record of what got refused.
+    # Always [] for pi, which has no equivalent flag. spec §7c.
+    permission_denials: list = Field(default_factory=list)
 
 
 PiResult = CodingAgentResult        # back-compat alias
