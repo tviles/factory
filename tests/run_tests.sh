@@ -30,6 +30,16 @@ for arg in "$@"; do
   esac
 done
 [ ${#targets[@]} -eq 0 ] && targets=(tests)
+# `set -u` + an EMPTY array expansion ("${flags[@]}" with nothing appended) is
+# an unbound-variable error on bash <= 4.2 — stock macOS ships 3.2, and the
+# shebang's `env bash` resolves to it on any Mac with no newer bash earlier on
+# PATH. `"$@"` is specifically exempt from `set -u`; a hand-rolled array is
+# not, so the flagless and path-only forms (the two Extra A exists to fix)
+# aborted with `flags[@]: unbound variable`. `${arr[@]+"${arr[@]}"}` is the
+# standard set-u-safe idiom: expands to nothing when the array is empty
+# instead of tripping the unset check. `targets` can't currently go empty
+# (defaulted just above), but the same guard costs nothing and removes the
+# assumption.
 exec uv run --quiet \
   --with pytest --with pydantic --with pyyaml --with python-dotenv --with rich \
-  pytest "${targets[@]}" "${flags[@]}"
+  pytest ${targets[@]+"${targets[@]}"} ${flags[@]+"${flags[@]}"}
