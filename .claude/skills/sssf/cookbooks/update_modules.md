@@ -10,11 +10,11 @@ Extend `adws/adw_modules/` with new low-level logic.
 
 | Module | Owns |
 |---|---|
-| `data_types.py` | Every Pydantic model: `AgentCall`, `PhaseParams`, `Phase`, `EnvelopeBase` + one output type per agent call, the config models (`AgentConfig`, `SSSFConfig`), `EventRecord`, and `PiRequest`/`PiResult` |
-| `agents.py` | `load_config`, `validate`, resolving an entry → coding-agent interface + model + thinking + harness extensions |
+| `data_types.py` | Every Pydantic model: `AgentCall`, `PhaseParams`, `Phase`, `EnvelopeBase` + one output type per agent call, the config models (`AgentConfig`, `SSSFConfig`), `EventRecord`, and `CodingAgentRequest`/`CodingAgentResult` (aliased as `PiRequest`/`PiResult`) |
+| `agents.py` | `load_config`, `validate`, resolving an entry → coding-agent interface + model + thinking + harness extensions; dispatches `coding_agent` through `ADAPTERS` |
 | `runner.py` | the `Run` object; `run.phase(PhaseParams)` context manager; `ph.call(AgentCall)` |
-| `agent_pi.py` | the Pi interface (v1) — non-interactive `pi -p --mode json`, JSONL stream tailed live, model resolved against `~/.pi/agent/models.json`; `--session-id` creates-or-continues, so running and continuing an agent are the same call |
-| `agent_cc.py` | the Claude Code interface — stubbed in v1, lands in v2 |
+| `agent_pi.py` | the Pi interface — non-interactive `pi -p --mode json`, JSONL stream tailed live, model resolved against `~/.pi/agent/models.json`; `--session-id` creates-or-continues, so running and continuing an agent are the same call |
+| `agent_cc.py` | the Claude Code interface — headless `claude -p --output-format stream-json --verbose`, JSONL stream tailed live, `--session-id` creates / `--resume` continues |
 | `gates.py` | validation gates over envelope claims |
 | `changes.py` | deterministic change capture: resolve the base ref, `git diff` into `context_handoff/changes.diff`, adapt the `ChangeSet` into an envelope an agent can be handed |
 | `prompts.py` | load system/user prompt refs from config, render placeholders |

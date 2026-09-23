@@ -10,8 +10,10 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
+from typing import Optional
 
-from .data_types import AgentConfig, EventRecord, GateReport, Phase
+from .data_types import (AgentSessionRecord, EnvelopeRecord, EventRecord,
+                         GateReport, Phase, ProcessRecord)
 from .utils import ensure_dir, new_id, now_iso
 
 SCHEMA = """
@@ -84,6 +86,7 @@ CREATE TABLE IF NOT EXISTS agent_sessions (
   session_id    TEXT,
   context_tokens INTEGER,           -- window occupancy after the agent's last turn
   context_window INTEGER,           -- the model's ceiling; 0/NULL = unknown
+  cost_basis    TEXT DEFAULT 'billed',   -- 'billed' (real money) | 'list' (subscription notional)
   created_at    TEXT, last_used_at TEXT,
   PRIMARY KEY (adw_id, agent)
 );
@@ -96,7 +99,55 @@ MIGRATIONS = [("agent_sessions", "color", "TEXT"),
               ("sessions", "adw_name", "TEXT"),
               ("agent_sessions", "context_tokens", "INTEGER"),
               ("agent_sessions", "context_window", "INTEGER"),
-              ("sessions", "archived", "INTEGER DEFAULT 0")]
+              ("sessions", "archived", "INTEGER DEFAULT 0"),
+              ("agent_sessions", "cost_basis", "TEXT DEFAULT 'billed'")]
+
+
+def last_rate_limit(db_path: str | Path) -> Optional[dict]:
+    """The most recent rate_limit_info any claude_code agent recorded.
+
+    A plain function opening a READ-ONLY connection, so validate() can consult
+    the trace without constructing a Tracer — which would create the db file
+    and run migrations as a side effect of a check that is supposed to be
+    inert. Returns None when there is no db yet, or no claude_code history:
+    the first run of a fresh repo simply has nothing to go on.
+
+    Scans two event shapes: a successful send's `agent_end` (the ordinary
+    case), and a failed send's `rate_limit_observed` log (agents.py's send() —
+    RateLimited/OverageRefused propagate straight out of execute(), before
+    agent_end ever fires, so a rejected/blocked window — the reading most
+    likely to trip the headroom guard below — would otherwise never reach the
+    trace at all; review Important #5).
+    """
+    if not Path(db_path).exists():
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return None
+    try:
+        for (payload,) in conn.execute(
+                "SELECT payload_json FROM events WHERE type='agent_end' "
+                "   OR (type='log' AND name='rate_limit_observed') "
+                "ORDER BY rowid DESC LIMIT 25"):
+            try:
+                parsed = json.loads(payload or "{}")
+            except json.JSONDecodeError:
+                continue
+            # A payload can be valid JSON and still not be an object — e.g. a
+            # bare list or scalar — and `.get` on that raises AttributeError.
+            # That must degrade to "keep looking", not blow up a check whose
+            # whole job is to be inert.
+            if not isinstance(parsed, dict):
+                continue
+            rate_limit = parsed.get("rate_limit")
+            if isinstance(rate_limit, dict) and rate_limit:
+                return rate_limit
+        return None
+    except sqlite3.Error:
+        return None            # an older db without the column is not an error
+    finally:
+        conn.close()
 
 
 class Tracer:
@@ -158,11 +209,59 @@ class Tracer:
                           (request[:500], adw_id))
 
     def session_finish(self, adw_id: str, ok: bool) -> None:
+        """Write the session's final status. Does NOT close the connection.
+
+        session_finish is called from three places, and on two of them it is
+        NOT the last write of the run: Run.finish and Run.phase's except
+        branch (runner.py) both call it and then keep going — phase_ended /
+        session_finished on Console, which traces through Console._emit ->
+        tracer.event. A close() here would hand those later writes a dead
+        connection (`AttributeError: 'NoneType' object has no attribute
+        'execute'`), burying whatever real error the run was reporting.
+        Closing is the caller's job, done once every write for that path is
+        actually finished — see Run.finish and Run.phase in runner.py.
+
+        The guard below still matters even without a close() in this method:
+        session._finalize_when_killed's SIGTERM/SIGINT handler calls this
+        unconditionally and cannot know whether the run already finished
+        normally (and its runner.py tail already closed the connection) —
+        that race must stay a safe no-op, not a crash inside a signal
+        handler.
+        """
+        if self.conn is None:
+            return
         self.conn.execute(
             "UPDATE sessions SET status=?, ended_at=? WHERE adw_id=?",
             ("success" if ok else "fail", now_iso(), adw_id),
         )
         self.processes_end_all(adw_id)   # nothing of this run is alive any more
+
+    def close(self) -> None:
+        """Release the sqlite connection this Tracer owns.
+
+        `-W error::ResourceWarning` reported one unclosed-database warning per
+        Tracer built in the test suite before this existed — one connection
+        per Tracer (unlike the per-SEND pipe leak agent_pi.py/agent_cc.py fix,
+        this is per-run, so it is far less severe, but it is still a resource
+        this object owns and never released). Idempotent: a second call (a
+        defensive future caller, or racing paths that both reach a close())
+        must not raise.
+
+        Called explicitly by runner.py's Run.finish and by Run.phase's except
+        branch, each AFTER their last console/tracer write for that path —
+        never from session_finish itself (see its docstring). The signal
+        handler in session.py deliberately does NOT call this: it cannot tell
+        whether Run.phase's except branch still needs the connection for the
+        writes that follow session_finish on that path, so closing there
+        would reintroduce the exact bug this split fixes. When a kill signal
+        lands outside any phase and outside Run.finish, the connection is
+        simply left for the process teardown to reclaim — a rare, inert
+        trade against the alternative of a live connection being closed out
+        from under a write in progress.
+        """
+        if self.conn is not None:
+            self.conn.close()
+            self.conn = None
 
     def session_add_usage(self, adw_id: str, tokens: int, cost: float) -> None:
         self.conn.execute(
@@ -171,8 +270,7 @@ class Tracer:
         )
 
     # ── processes (adw_id → pid, so a hung run can be found and killed) ─────
-    def process_start(self, adw_id: str, kind: str, name: str, pid: int,
-                      command: str) -> None:
+    def process_start(self, record: ProcessRecord) -> None:
         """Record a live process for this run.
 
         A coding agent that hangs produces no events at all, which is exactly
@@ -183,7 +281,8 @@ class Tracer:
         self.conn.execute(
             "INSERT INTO processes (adw_id, kind, name, pid, command, started_at)"
             " VALUES (?,?,?,?,?,?)",
-            (adw_id, kind, name, pid, command[:500], now_iso()),
+            (record.adw_id, record.kind, record.name, record.pid,
+             record.command[:500], now_iso()),
         )
 
     def process_end(self, adw_id: str, pid: int) -> None:
@@ -229,13 +328,13 @@ class Tracer:
         )
 
     # ── envelopes / gates / agent sessions ──────────────────────────────────
-    def envelope_row(self, phase: Phase, agent: str, output_type: str,
-                     payload_json: str, valid: bool, attempt: int) -> None:
+    def envelope_row(self, record: EnvelopeRecord) -> None:
         self.conn.execute(
             "INSERT INTO envelopes (envelope_id, adw_id, phase_id, agent, output_type,"
             " payload_json, valid, attempt, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
-            (f"env_{new_id(12)}", phase.adw_id, phase.phase_id, agent, output_type,
-             payload_json, int(valid), attempt, now_iso()),
+            (f"env_{new_id(12)}", record.phase.adw_id, record.phase.phase_id,
+             record.agent, record.output_type, record.payload_json,
+             int(record.valid), record.attempt, now_iso()),
         )
 
     def gate_row(self, phase: Phase, gate: str, report: GateReport, attempt: int) -> None:
@@ -248,8 +347,7 @@ class Tracer:
              json.dumps([c.model_dump() for c in report.checks]), now_iso()),
         )
 
-    def agent_session_row(self, adw_id: str, agent: AgentConfig, session_id: str,
-                          context_tokens: int = 0, context_window: int = 0) -> None:
+    def agent_session_row(self, record: AgentSessionRecord) -> None:
         """The agent's config row is the source of truth for its label and color.
 
         Context is carried here rather than derived from events because the lane
@@ -257,15 +355,19 @@ class Tracer:
         same agent twice overwrites it, exactly like model and session_id.
         """
         ts = now_iso()
+        agent = record.agent
         self.conn.execute(
             "INSERT INTO agent_sessions (adw_id, agent, coding_agent, model, color,"
-            " session_id, context_tokens, context_window, created_at, last_used_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?)"
+            " session_id, context_tokens, context_window, cost_basis, created_at,"
+            " last_used_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?)"
             " ON CONFLICT(adw_id, agent) DO UPDATE SET model=excluded.model,"
             " color=excluded.color, session_id=excluded.session_id,"
             " context_tokens=excluded.context_tokens,"
             " context_window=excluded.context_window,"
+            " cost_basis=excluded.cost_basis,"
             " last_used_at=excluded.last_used_at",
-            (adw_id, agent.name, agent.coding_agent, agent.model, agent.color,
-             session_id, context_tokens, context_window, ts, ts),
+            (record.adw_id, agent.name, agent.coding_agent, agent.model, agent.color,
+             record.session_id, record.context_tokens, record.context_window,
+             record.cost_basis, ts, ts),
         )

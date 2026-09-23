@@ -322,6 +322,23 @@ class AgentConfig(BaseModel):
     writes: Optional[list[str]] = None
 
 
+class ClaudeCodeDefaults(BaseModel):
+    """Knobs that only mean something for coding_agent: claude_code."""
+
+    # False strips ANTHROPIC_API_KEY et al from the child env, which is what
+    # keeps a run on the Max subscription instead of per-token API billing.
+    inherit_api_key: bool = False
+    timeout_seconds: int = 1800
+    # A subscription past its limits falls through to PAID overage. "fail"
+    # aborts the moment that is observed; "warn" logs and continues.
+    on_overage: Literal["fail", "warn"] = "fail"
+    # Refuse to START a chain when a LIVE rate-limit window was last observed
+    # at or above this utilisation. 1.0 (the default) refuses only a window
+    # read as fully exhausted — which can never be a false alarm, because a
+    # recorded utilisation is a lower bound until its resetsAt passes.
+    max_utilization: float = 1.0
+
+
 class ConfigDefaults(BaseModel):
     coding_agent: Literal["pi", "claude_code"] = "pi"
     model: str = "google/gemini-3.6-flash"
@@ -336,6 +353,7 @@ class ConfigDefaults(BaseModel):
         "adws/adw_modules/", "adws/adw_sssf_config/", "adws/adw_*.py",
     ])
     data_dir: str = "adws/adw_data"
+    claude_code: ClaudeCodeDefaults = Field(default_factory=ClaudeCodeDefaults)
 
 
 class ObservabilityConfig(BaseModel):
@@ -350,6 +368,23 @@ class SSSFConfig(BaseModel):
 
 
 # ── Tracing ──────────────────────────────────────────────────────────────────
+
+class ProcessRecord(BaseModel):
+    """Everything tracer.process_start() needs. One object, never loose params.
+
+    A coding agent that hangs produces no events at all, which is exactly when
+    you need its pid — and `ps` cannot tell you which adw_id it belongs to.
+    `command` is what makes a recycled pid safe to leave alone rather than
+    kill by mistake (see Tracer.process_start's docstring); that behaviour
+    must survive this type unchanged.
+    """
+
+    adw_id: str
+    kind: str                       # 'adw' (the workflow process) | 'agent' (a coding-agent child)
+    name: str                       # '' for the adw, the agent name for a child
+    pid: int
+    command: str
+
 
 class EventRecord(BaseModel):
     """One traced event, always logged against adw_id + phase."""
@@ -368,21 +403,113 @@ class EventRecord(BaseModel):
     ended_at: Optional[str] = None
 
 
+class AgentSessionRecord(BaseModel):
+    """Everything tracer.agent_session_row() needs. One object, never loose params.
+
+    The row is an upsert keyed on (adw_id, agent): identity (agent, session_id)
+    and the latest context/cost readings all land in the same write, and the
+    caller (agents.py's execute()) already has every field on hand at that one
+    moment — this was five params before cost_basis made it six, the second
+    time this signature grew past the four-param rule rather than the first.
+    """
+
+    adw_id: str
+    agent: AgentConfig
+    session_id: str
+    context_tokens: int = 0         # window occupancy after the agent's last turn
+    context_window: int = 0         # the model's ceiling; 0/NULL = unknown
+    cost_basis: str = "billed"      # 'billed' (real money) | 'list' (subscription notional)
+
+
+class EnvelopeRecord(BaseModel):
+    """Everything tracer.envelope_row() needs. One object, never loose params.
+
+    A row is written on every parse attempt, valid or not — `_parse_with_retries`'s
+    correction loop calls this on each failed attempt too, so a run's envelope
+    history shows every retry, not just the one that finally validated. That was
+    six loose params (phase, agent, output_type, payload_json, valid, attempt);
+    the same hard-rule-4 violation `dafa60b` fixed for agent_session_row and
+    process_start, surveyed then and left for a follow-up rather than bundled in.
+    """
+
+    phase: Phase
+    agent: str
+    output_type: str
+    payload_json: str
+    valid: bool
+    attempt: int
+
+
+class EnvelopePersistence(BaseModel):
+    """Everything agents._persist_envelope() needs besides `run`. One object,
+    never loose params.
+
+    _persist_envelope is what DERIVES an EnvelopeRecord's payload_json — the
+    envelope's own JSON on a successful parse, `{"raw": ...}` on a failed one
+    — and, on success, also writes agent_dir/envelope.json to disk. That is
+    strictly more than EnvelopeRecord itself carries (`call` down to its
+    output_type name, `envelope` before it is serialized, `raw` for the
+    failure branch), so it is its own type rather than a reuse of
+    EnvelopeRecord. Was eight loose params (run, phase, agent_name, call,
+    envelope, attempt, valid, raw) — the same hard-rule-4 violation
+    `dafa60b`/`ed85936` fixed for Tracer's own methods, left for a follow-up
+    because both call sites are inside agents.py, not Tracer, and the
+    function is private. `run` stays a separate top-level param rather than
+    folded in here: `execute(run, phase, call)`, three lines above the first
+    call site, is this file's own established shape for "the run context plus
+    what this call is about" — bundling `run` in here too would contradict it.
+    """
+
+    phase: Phase
+    agent_name: str
+    call: AgentCall
+    envelope: Optional[EnvelopeBase] = None
+    attempt: int
+    valid: bool
+    raw: str = ""
+
+
 # ── Pi coding agent interface ────────────────────────────────────────────────
 
-class PiRequest(BaseModel):
-    """Everything one non-interactive pi run needs."""
+class CodingAgentRequest(BaseModel):
+    """Everything one non-interactive coding-agent turn needs.
+
+    One type for both adapters. Fields a given harness cannot use are inert
+    there rather than duplicated into a parallel type: Pi ignores `resume`
+    because `--session-id` already creates-or-continues, and Claude Code
+    ignores `session_dir` because it stores transcripts under its own
+    projects directory (spec §2).
+    """
 
     prompt: str
-    system_prompt: str
-    model: str                      # registry pattern, resolved to provider + id
+    system_prompt: str              # rendered text — Pi passes this in argv
+    # The same text, already on disk at {agent_dir}/prompts/system.md. Claude
+    # Code takes --append-system-prompt-file, which keeps the largest argument
+    # out of argv AND makes the audit copy literally the bytes that were sent.
+    system_prompt_path: str = ""
+    model: str                      # provider/model-id
     thinking: str = "medium"
-    session_id: str                 # pi --session-id: creates or continues
-    session_dir: str
+    session_id: str                 # sssf id; Claude Code maps it to a uuid
+    # False = create the session, True = continue it. Pi ignores this.
+    resume: bool = False
+    session_dir: str = ""           # Pi only
     raw_output_path: str            # JSONL stream lands here
+    stderr_path: str = ""           # child stderr; "" = beside raw_output
     tools: Optional[list[str]] = None
+    # Claude Code --restricted, set for agents with `writes: []`. Removes
+    # settings-file loading and confines file tools to the working dirs. The
+    # roster's tools survive it: --restricted only strips code-running tools
+    # that --tools does NOT name.
+    restricted: bool = False
+    # "fail" aborts the send when the subscription is on PAID overage.
+    on_overage: str = "fail"
     extensions: list[str] = Field(default_factory=list)
-    cwd: str = "."                  # set from run.repo_root — the codebase root agents work in
+    cwd: str = "."                  # run.repo_root — the codebase agents work in
+    timeout_seconds: int = 1800     # wall clock; 0 disables
+    inherit_api_key: bool = False
+
+
+PiRequest = CodingAgentRequest      # back-compat alias
 
 
 class UsageBreakdown(BaseModel):
@@ -429,11 +556,11 @@ class UsageBreakdown(BaseModel):
 
     def merge(self, other: "UsageBreakdown") -> None:
         """Add another call's usage — a phase that retries spends more than once."""
-        for field in self.model_fields:
+        for field in type(self).model_fields:
             setattr(self, field, getattr(self, field) + getattr(other, field))
 
 
-class PiResult(BaseModel):
+class CodingAgentResult(BaseModel):
     text: str = ""
     returncode: int = 0
     session_id: str = ""
@@ -445,3 +572,23 @@ class PiResult(BaseModel):
     # visualizer's context bar measures against `context_window`.
     context_tokens: int = 0
     context_window: int = 0         # 0 when the registry declares no ceiling
+    # "billed" (pi: real money) vs "list" (claude_code on a subscription:
+    # notional list price). The UI must not present the two the same way.
+    cost_basis: str = "billed"
+    # The last rate_limit_event's `rate_limit_info`, verbatim. Stored whole
+    # rather than as a bare utilisation float because `unifiedWindows` and
+    # `resetsAt` are what let a later read tell a live window from one that has
+    # since reset — without them the headroom check is guesswork.
+    rate_limit: dict = Field(default_factory=dict)
+    # Child stderr lines worth surfacing. The CLI reports real problems here
+    # (`Warning: Unknown --effort value …`) while exiting 0, so without this
+    # the trace is blind to them.
+    warnings: list[str] = Field(default_factory=list)
+    # Claude Code's `result.permission_denials`, verbatim. The adapter runs
+    # with `--permission-prompts none`, which turns every would-be prompt into
+    # a SILENT automatic denial — this is the only record of what got refused.
+    # Always [] for pi, which has no equivalent flag. spec §7c.
+    permission_denials: list = Field(default_factory=list)
+
+
+PiResult = CodingAgentResult        # back-compat alias

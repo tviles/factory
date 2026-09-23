@@ -42,11 +42,11 @@ agents:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `coding_agent` | `pi` \| `claude_code` | Which interface runs the agent. **v1 implements `pi` only**; `claude_code` is specced and stubbed in `agent_cc.py`, landing in v2. |
+| `coding_agent` | `pi` \| `claude_code` | Which interface runs the agent. `pi` -> `agent_pi.py`; `claude_code` -> `agent_cc.py` (headless `claude -p`, billed to your Claude subscription). |
 | `model` | string | Model id. For Pi, any id registered in `~/.pi/agent/models.json`. Default `gemini-3.6-flash`. |
 | `thinking` | enum | Reasoning effort — see below. Default `medium`. |
 | `color` | hex string | Lane color for every agent that does not set its own. Default empty — the visualizer falls back to its own palette. |
-| `harness_engineering` | list[string] | Coding-agent extensions. Pi: extension names. Claude Code: reserved (MCP, hooks). |
+| `harness_engineering` | list[string] | Coding-agent extensions. Pi: extension names. **Not supported for `coding_agent: claude_code`** — must be empty; see below. |
 | `tools` | list[string] | Roster-wide tool allowlist. Every agent that omits its own `tools` inherits this. Unset = all tools usable. |
 | `protected_files` | list[string] | Paths **no** agent may modify unless it names them in its own `writes`. Default: `adws/adw_modules/`, `adws/adw_sssf_config/`, `adws/adw_*.py` — an agent must not be able to edit the machinery that decides whether its work passed. |
 | `data_dir` | path | Runtime home. Sessions land at `{data_dir}/sessions/{adw_id}/{agent_name}/`. Default `adws/adw_data`. |
@@ -85,7 +85,9 @@ Pi's reasoning-effort ladder, lowest to highest:
 off | minimal | low | medium | high | xhigh | max
 ```
 
-Mapped to Pi's reasoning effort control and honored when the model is registered with `reasoning: true` in `~/.pi/agent/models.json`. On a non-reasoning model the setting is inert — no error, no effect. Rough guidance: `high`/`xhigh` for planners and reviewers, `medium` for builders, `low` for mechanical read-and-report agents. (For Claude Code in v2, the same field maps to the thinking budget.)
+Mapped to Pi's reasoning effort control and honored when the model is registered with `reasoning: true` in `~/.pi/agent/models.json`. On a non-reasoning model the setting is inert — no error, no effect. Rough guidance: `high`/`xhigh` for planners and reviewers, `medium` for builders, `low` for mechanical read-and-report agents.
+
+On Claude Code this maps to `--effort`, whose ladder is `low|medium|high|xhigh|max`. `off` and `minimal` clamp to `low` with a logged warning — passing them through makes the CLI warn on stderr and silently use its OWN default, which is neither what you asked for nor the lowest setting.
 
 ## Model resolution
 
@@ -105,6 +107,8 @@ Other consequences worth knowing:
 - Provider credentials come from the environment, not the config — the key that matches the provider you named (`GEMINI_API_KEY` for `google/...`, `OPENROUTER_API_KEY` for `openrouter/...`).
 - The resolved model is recorded per session in `agent_map.json` and mirrored into the `agent_sessions` table. **Changing an agent's model invalidates its session**: a joined run starts that agent fresh instead of resuming a context window built by a different model.
 
+**For `coding_agent: claude_code` the provider must be `anthropic`** — `anthropic/claude-opus-5`, `anthropic/claude-sonnet-5`, or an alias like `anthropic/opus`. There is no catalog lookup; the id after the slash is handed to `claude --model`. Any other provider fails in `agents.validate()` before a phase opens.
+
 ## Tools
 
 `tools` maps to `pi --tools`. Pi's seven builtin tool names:
@@ -122,6 +126,24 @@ Other consequences worth knowing:
 `grep`, `find`, and `ls` are off in bare Pi, so an agent that does not name them will shell out through `bash` to do the same work. The starter roster therefore sets `defaults.tools` to all seven and lets each agent narrow from there.
 
 **Resolution order:** an agent's own `tools` list wins; an agent that omits the key inherits `defaults.tools`; if neither is set, `tools` stays `None` and all tools are usable. An empty list is not "all tools" — it is a tool-less agent, and it will stall.
+
+### Tool names on Claude Code
+
+`tools` maps to `claude --tools`, and the six Pi builtin names above translate:
+
+| `tools:` name | Claude Code tool |
+|---|---|
+| `read` | `Read` |
+| `bash` | `Bash` |
+| `edit` | `Edit` |
+| `write` | `Write` |
+| `grep` | `Grep` |
+| `find` | `Glob` |
+| `ls` | **no equivalent — dropped, with a warning** |
+
+`ls` has no Claude Code counterpart. Mapping it onto `Bash` was considered and rejected: that would hand shell access to an agent whose `tools` list never asked for it, silently widening a `writes: []` agent's blast radius.
+
+An unknown tool name **fails validation** rather than passing through. The Claude Code CLI itself *silently drops* an unrecognized `--tools` entry: the run succeeds and the tool is simply never offered to the model, so `agents.validate()` catches the typo up front instead of letting it fail quietly at runtime.
 
 ## Write permissions — `writes` and `protected_files`
 
@@ -195,8 +217,17 @@ This fails quietly. The extension still loads, the run still succeeds, and the t
 
 Rule: **every entry in `harness_engineering` that registers a tool must have that tool name added to the agent's `tools` list.** Adding an extension is therefore a two-line change, never one. The alternative is dropping the `tools` key *and* leaving `defaults.tools` unset so the agent resolves to `None` (all tools) — but with a roster-wide `defaults.tools` in place, that escape hatch is closed; naming the tool is the only path.
 
+> **This escape hatch does not exist for `coding_agent: claude_code`.** There,
+> `tools: None` resolves to the six-tool Pi-equivalent set
+> (`Read, Bash, Edit, Write, Grep, Glob`), *not* "every tool". Omitting
+> `--tools` would hand the agent all 28 Claude Code tools, including
+> `CronCreate` (schedules work that outlives the run), `RemoteTrigger` and
+> `PushNotification` (reach off the machine), `Workflow`, `Skill` (can reach
+> the sssf skill itself) and `EnterWorktree` — which moves cwd and breaks both
+> the `writes` boundary and session resumption. Name what you need.
+
 ## Harness engineering
 
-`harness_engineering` entries are pi extension **file paths**, passed through as `pi -e <path>`, one flag per entry, scoped to that agent only. This is where per-agent harness changes live — e.g. an output-tightening extension for an agent that keeps wrapping its envelope in prose. The starter roster ships with none. On Claude Code the field is reserved for MCP config and hooks in v2.
+`harness_engineering` entries are pi extension **file paths**, passed through as `pi -e <path>`, one flag per entry, scoped to that agent only. This is where per-agent harness changes live — e.g. an output-tightening extension for an agent that keeps wrapping its envelope in prose. The starter roster ships with none. **Not supported for `coding_agent: claude_code`** — entries are Pi extension paths and cannot load. A non-empty list fails `agents.validate()`. Claude Code's built-in `Task` tool replaces `subagents.ts`; name `Task` in `tools` instead.
 
 **If the extension registers a tool, name that tool in the agent's `tools` list too** — `--tools` filters extension tools exactly like builtins, so an unnamed extension tool is silently unavailable no matter that the extension loaded fine. See [Extension tools must be named explicitly](#extension-tools-must-be-named-explicitly) above. Extensions that only shape output or add flags (no tool registration) need no `tools` change.
